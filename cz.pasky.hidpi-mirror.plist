@@ -6,7 +6,10 @@
 	<string>cz.pasky.hidpi-mirror</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/pasky/src/hidpi-mirror/hidpi-mirror</string>
+		<!-- Adjust the path to wherever you built hidpi-mirror,
+		     and the size to your preferred "looks like" resolution.
+		     Optional third argument: display vendor id (default Dell). -->
+		<string>/Users/YOURUSERNAME/src/hidpi-mirror/hidpi-mirror</string>
 		<string>2048</string>
 		<string>1152</string>
 	</array>
@@ -17,8 +20,8 @@
 	<key>LimitLoadToSessionType</key>
 	<string>Aqua</string>
 	<key>StandardOutPath</key>
-	<string>/Users/pasky/src/hidpi-mirror/hidpi-mirror.log</string>
+	<string>/tmp/hidpi-mirror.log</string>
 	<key>StandardErrorPath</key>
-	<string>/Users/pasky/src/hidpi-mirror/hidpi-mirror.log</string>
+	<string>/tmp/hidpi-mirror.log</string>
 </dict>
 </plist>

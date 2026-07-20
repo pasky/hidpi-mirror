@@ -5,8 +5,10 @@
 //
 // Build: clang -fobjc-arc -framework Foundation -framework CoreGraphics \
 //        -o hidpi-mirror hidpi-mirror.m
-// Usage: ./hidpi-mirror [lookslike_width lookslike_height]
-//        default 2048 1152 (~125% UI scale); runs until killed.
+// Usage: ./hidpi-mirror [lookslike_width lookslike_height [vendor_id]]
+//        default 2048 1152 (~125% UI scale on QHD); vendor_id selects the
+//        physical display to mirror onto (default 4268 = Dell).
+//        Runs until killed; on exit the physical display reverts.
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -47,7 +49,7 @@
 @end
 // --------------------------------------------------------------------------
 
-static const uint32_t kDellVendor = 4268; // 0x10AC
+static uint32_t gVendor = 4268; // 0x10AC = Dell; override via argv[3]
 
 static CGVirtualDisplay *gVirtual = nil;  // keep-alive
 static CGDirectDisplayID gVirtualID = 0;
@@ -60,7 +62,7 @@ static CGDirectDisplayID findDell(void) {
     for (uint32_t i = 0; i < count; i++) {
         if (CGDisplayIsBuiltin(ids[i])) continue;
         if (ids[i] == gVirtualID) continue;
-        if (CGDisplayVendorNumber(ids[i]) == kDellVendor) return ids[i];
+        if (CGDisplayVendorNumber(ids[i]) == gVendor) return ids[i];
     }
     return kCGNullDirectDisplay;
 }
@@ -161,11 +163,13 @@ int main(int argc, char *argv[]) {
         CGVirtualDisplayDescriptor *desc =
             [[NSClassFromString(@"CGVirtualDisplayDescriptor") alloc] init];
         if (!desc) { NSLog(@"CGVirtualDisplay API unavailable"); return 1; }
-        if (argc == 3) {
+        if (argc >= 3) {
             gLW = (unsigned int)atoi(argv[1]);
             gLH = (unsigned int)atoi(argv[2]);
         }
-        desc.name = @"DELL U2520D (HiDPI)";
+        if (argc >= 4)
+            gVendor = (uint32_t)strtoul(argv[3], NULL, 0);
+        desc.name = @"HiDPI Mirror";
         desc.queue = dispatch_get_main_queue();
         // Physical size of the U2520D panel => sane reported DPI
         desc.sizeInMillimeters = CGSizeMake(553.7, 311.3);
