@@ -95,11 +95,15 @@ static CGDisplayModeRef copyWantedMode(void) {
 }
 
 static void mirrorNow(void) {
+    static BOOL wasOffline = NO;
     CGDirectDisplayID dell = findDell();
     if (dell == kCGNullDirectDisplay) {
-        NSLog(@"Dell not online (KVM switched away?), waiting...");
+        if (!wasOffline)
+            NSLog(@"display not online (KVM switched away?), waiting...");
+        wasOffline = YES;
         return;
     }
+    wasOffline = NO;
     BOOL mirrored = (CGDisplayMirrorsDisplay(dell) == gVirtualID);
     BOOL rightMode =
         CGDisplayModeGetPixelWidth((CGDisplayModeRef)CFAutorelease(
@@ -240,7 +244,19 @@ int main(int argc, char *argv[]) {
 
         CGDisplayRegisterReconfigurationCallback(reconfigCB, NULL);
         mirrorNow();
-        dispatch_main();
+        // Belt and braces: reconfiguration callbacks have proven flaky
+        // across login sessions, so also poll (cheap no-op when all good).
+        dispatch_source_t poll = dispatch_source_create(
+            DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(poll,
+                                  dispatch_time(DISPATCH_TIME_NOW, 0),
+                                  10 * NSEC_PER_SEC, NSEC_PER_SEC);
+        dispatch_source_set_event_handler(poll, ^{ mirrorNow(); });
+        dispatch_resume(poll);
+        // NB: must be CFRunLoopRun, NOT dispatch_main() --
+        // CGDisplayRegisterReconfigurationCallback delivers via CFRunLoop
+        // (and the main runloop drains the main GCD queue too).
+        CFRunLoopRun();
     }
     return 0;
 }
