@@ -54,6 +54,7 @@ static uint32_t gVendor = 4268; // 0x10AC = Dell; override via argv[3]
 static CGVirtualDisplay *gVirtual = nil;  // keep-alive
 static CGDirectDisplayID gVirtualID = 0;
 static unsigned int gLW = 2048, gLH = 1152; // desired "looks like" size
+static volatile BOOL gTearingDown = NO; // we destroy the virtual ourselves
 
 static CGDirectDisplayID findDell(void) {
     CGDirectDisplayID ids[16];
@@ -94,6 +95,81 @@ static CGDisplayModeRef copyWantedMode(void) {
     return want;
 }
 
+// Create the virtual HiDPI display. Returns NO on failure.
+static BOOL createVirtual(void) {
+    CGVirtualDisplayDescriptor *desc =
+        [[NSClassFromString(@"CGVirtualDisplayDescriptor") alloc] init];
+    desc.name = @"HiDPI Mirror";
+    desc.queue = dispatch_get_main_queue();
+    // Physical size of the U2520D panel => sane reported DPI
+    desc.sizeInMillimeters = CGSizeMake(553.7, 311.3);
+    desc.maxPixelsWide = 5120;
+    desc.maxPixelsHigh = 2880;
+    // sRGB-ish primaries
+    desc.redPrimary   = CGPointMake(0.680, 0.320);
+    desc.greenPrimary = CGPointMake(0.265, 0.690);
+    desc.bluePrimary  = CGPointMake(0.150, 0.060);
+    desc.whitePoint   = CGPointMake(0.3127, 0.3290);
+    // Fresh identity (macOS stores mode prefs per vendor+product; the
+    // original identity has a stale 3840x2160@1x preference stuck to it)
+    desc.vendorID  = 0xB33F;
+    desc.productID = 0x2049 + gLW / 16 + gLH; // identity varies per size
+    desc.serialNum = 1;
+    desc.terminationHandler = ^(id a, id b) {
+        if (gTearingDown) return; // our own teardown, not an external kill
+        NSLog(@"virtual display terminated");
+        exit(0);
+    };
+
+    gVirtual = [[NSClassFromString(@"CGVirtualDisplay") alloc]
+                   initWithDescriptor:desc];
+    if (!gVirtual) { NSLog(@"failed to create virtual display"); return NO; }
+    gVirtualID = gVirtual.displayID;
+
+    CGVirtualDisplaySettings *settings =
+        [[NSClassFromString(@"CGVirtualDisplaySettings") alloc] init];
+    settings.hiDPI = 1;
+    // Offer exactly ONE mode: the desired "looks like" size at 2x.
+    // This way neither macOS nor a stray click can pick a wrong mode.
+    Class modeCls = NSClassFromString(@"CGVirtualDisplayMode");
+    // WindowServer ignores programmatic mode changes on virtual displays
+    // and always runs the PREFERRED (first listed) mode -- so put the
+    // desired mode first; keep the rest for HiDPI mode-list synthesis.
+    NSMutableArray *modes = [NSMutableArray arrayWithObject:
+        [[modeCls alloc] initWithWidth:gLW * 2 height:gLH * 2 refreshRate:60]];
+    unsigned int extra[][2] = {
+        {5120, 2880}, {4608, 2592}, {4096, 2304},
+        {3840, 2160}, {3360, 1890}, {3200, 1800},
+    };
+    for (size_t i = 0; i < sizeof(extra) / sizeof(extra[0]); i++)
+        if (extra[i][0] != gLW * 2)
+            [modes addObject:[[modeCls alloc] initWithWidth:extra[i][0]
+                                                     height:extra[i][1]
+                                                refreshRate:60]];
+    settings.modes = modes;
+    if (![gVirtual applySettings:settings]) {
+        NSLog(@"applySettings failed");
+        gVirtual = nil;
+        gVirtualID = 0;
+        return NO;
+    }
+    NSLog(@"virtual display up, id=%u (UI looks like %ux%u, framebuffer %ux%u)",
+          gVirtualID, gLW, gLH, gLW * 2, gLH * 2);
+    return YES;
+}
+
+static void destroyVirtual(void) {
+    if (!gVirtual) return;
+    NSLog(@"physical display gone, tearing down virtual display");
+    gTearingDown = YES;
+    gVirtual = nil; // releasing the object terminates the virtual display
+    gVirtualID = 0;
+    // Give WindowServer a beat to process the termination before we could
+    // possibly recreate; the flag is reset asynchronously.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{ gTearingDown = NO; });
+}
+
 static void mirrorNow(void) {
     static BOOL wasOffline = NO;
     CGDirectDisplayID dell = findDell();
@@ -101,9 +177,19 @@ static void mirrorNow(void) {
         if (!wasOffline)
             NSLog(@"display not online (KVM switched away?), waiting...");
         wasOffline = YES;
+        // No physical display -> no reason to keep the virtual one around
+        // (it would act as invisible screen estate collecting windows).
+        destroyVirtual();
         return;
     }
     wasOffline = NO;
+    if (!gVirtual) {
+        if (!createVirtual()) return; // retry on next poll
+        // Let WindowServer settle before mirroring onto the fresh display.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{ mirrorNow(); });
+        return;
+    }
     BOOL mirrored = (CGDisplayMirrorsDisplay(dell) == gVirtualID);
     BOOL rightMode =
         CGDisplayModeGetPixelWidth((CGDisplayModeRef)CFAutorelease(
@@ -133,8 +219,10 @@ static void mirrorNow(void) {
     if (want) CFRelease(want);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
+        if (!gVirtual) return;
         CGDisplayModeRef cur =
             (CGDisplayModeRef)CFAutorelease(CGDisplayCopyDisplayMode(gVirtualID));
+        if (!cur) return;
         NSLog(@"post-transaction actual mode: %zux%zu points, %zux%zu pixels",
               CGDisplayModeGetWidth(cur), CGDisplayModeGetHeight(cur),
               CGDisplayModeGetPixelWidth(cur), CGDisplayModeGetPixelHeight(cur));
@@ -154,9 +242,9 @@ static void unmirror(void) {
 
 static void reconfigCB(CGDirectDisplayID d, CGDisplayChangeSummaryFlags flags,
                        void *userInfo) {
-    if (flags & kCGDisplayAddFlag) {
-        // Display (re)appeared -- e.g. KVM switched back. Give WindowServer
-        // a moment to settle, then re-establish the mirror.
+    if (flags & (kCGDisplayAddFlag | kCGDisplayRemoveFlag)) {
+        // Display (dis)appeared -- e.g. KVM switch. Give WindowServer
+        // a moment to settle, then re-establish (or tear down) the mirror.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                        dispatch_get_main_queue(), ^{ mirrorNow(); });
     }
@@ -164,71 +252,19 @@ static void reconfigCB(CGDirectDisplayID d, CGDisplayChangeSummaryFlags flags,
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
-        CGVirtualDisplayDescriptor *desc =
-            [[NSClassFromString(@"CGVirtualDisplayDescriptor") alloc] init];
-        if (!desc) { NSLog(@"CGVirtualDisplay API unavailable"); return 1; }
+        if (!NSClassFromString(@"CGVirtualDisplayDescriptor")) {
+            NSLog(@"CGVirtualDisplay API unavailable");
+            return 1;
+        }
         if (argc >= 3) {
             gLW = (unsigned int)atoi(argv[1]);
             gLH = (unsigned int)atoi(argv[2]);
         }
         if (argc >= 4)
             gVendor = (uint32_t)strtoul(argv[3], NULL, 0);
-        desc.name = @"HiDPI Mirror";
-        desc.queue = dispatch_get_main_queue();
-        // Physical size of the U2520D panel => sane reported DPI
-        desc.sizeInMillimeters = CGSizeMake(553.7, 311.3);
-        desc.maxPixelsWide = 5120;
-        desc.maxPixelsHigh = 2880;
-        // sRGB-ish primaries
-        desc.redPrimary   = CGPointMake(0.680, 0.320);
-        desc.greenPrimary = CGPointMake(0.265, 0.690);
-        desc.bluePrimary  = CGPointMake(0.150, 0.060);
-        desc.whitePoint   = CGPointMake(0.3127, 0.3290);
-        // Fresh identity (macOS stores mode prefs per vendor+product; the
-        // original identity has a stale 3840x2160@1x preference stuck to it)
-        desc.vendorID  = 0xB33F;
-        desc.productID = 0x2049 + gLW / 16 + gLH; // identity varies per size
-        desc.serialNum = 1;
-        desc.terminationHandler = ^(id a, id b) {
-            NSLog(@"virtual display terminated");
-            exit(0);
-        };
-
-        gVirtual = [[NSClassFromString(@"CGVirtualDisplay") alloc]
-                       initWithDescriptor:desc];
-        if (!gVirtual) { NSLog(@"failed to create virtual display"); return 1; }
-        gVirtualID = gVirtual.displayID;
-
-        CGVirtualDisplaySettings *settings =
-            [[NSClassFromString(@"CGVirtualDisplaySettings") alloc] init];
-        settings.hiDPI = 1;
-        // Offer exactly ONE mode: the desired "looks like" size at 2x.
-        // This way neither macOS nor a stray click can pick a wrong mode.
-        // Full mode list (macOS only synthesizes proper HiDPI variants with
-        // a rich list topped by maxPixels); the desired one is selected
-        // explicitly in setHiDPIMode().
-        Class modeCls = NSClassFromString(@"CGVirtualDisplayMode");
-        // WindowServer ignores programmatic mode changes on virtual displays
-        // and always runs the PREFERRED (first listed) mode -- so put the
-        // desired mode first; keep the rest for HiDPI mode-list synthesis.
-        NSMutableArray *modes = [NSMutableArray arrayWithObject:
-            [[modeCls alloc] initWithWidth:gLW * 2 height:gLH * 2 refreshRate:60]];
-        unsigned int extra[][2] = {
-            {5120, 2880}, {4608, 2592}, {4096, 2304},
-            {3840, 2160}, {3360, 1890}, {3200, 1800},
-        };
-        for (size_t i = 0; i < sizeof(extra) / sizeof(extra[0]); i++)
-            if (extra[i][0] != gLW * 2)
-                [modes addObject:[[modeCls alloc] initWithWidth:extra[i][0]
-                                                         height:extra[i][1]
-                                                    refreshRate:60]];
-        settings.modes = modes;
-        NSLog(@"UI will look like %ux%u (framebuffer %ux%u)", gLW, gLH, gLW*2, gLH*2);
-        if (![gVirtual applySettings:settings]) {
-            NSLog(@"applySettings failed");
-            return 1;
-        }
-        NSLog(@"virtual display up, id=%u", gVirtualID);
+        NSLog(@"UI will look like %ux%u (framebuffer %ux%u); virtual display "
+              @"created on demand when physical display is online",
+              gLW, gLH, gLW * 2, gLH * 2);
 
         signal(SIGINT, SIG_IGN);
         signal(SIGTERM, SIG_IGN);
