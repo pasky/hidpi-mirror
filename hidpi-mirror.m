@@ -170,6 +170,35 @@ static void destroyVirtual(void) {
                    dispatch_get_main_queue(), ^{ gTearingDown = NO; });
 }
 
+// The virtual display is (re)created on demand, so macOS forgets it was
+// the main display across reconnects; the display whose origin is (0,0)
+// becomes main -- reclaim it for the mirror set. Must run as a separate
+// transaction after the mirror is established.
+static void claimMain(void) {
+    if (!gVirtual) return;
+    CGRect vb = CGDisplayBounds(gVirtualID);
+    int32_t dx = (int32_t)vb.origin.x, dy = (int32_t)vb.origin.y;
+    if (dx == 0 && dy == 0) return; // already main
+    // Translate the WHOLE arrangement so the virtual lands on (0,0):
+    // setting just one display's origin is silently normalized away.
+    CGDirectDisplayID ids[16];
+    uint32_t n = 0;
+    CGGetOnlineDisplayList(16, ids, &n);
+    CGDisplayConfigRef cfg;
+    CGBeginDisplayConfiguration(&cfg);
+    for (uint32_t i = 0; i < n; i++) {
+        if (CGDisplayMirrorsDisplay(ids[i]) != kCGNullDirectDisplay)
+            continue; // mirror followers inherit their master's origin
+        CGRect b = CGDisplayBounds(ids[i]);
+        CGConfigureDisplayOrigin(cfg, ids[i],
+                                 (int32_t)b.origin.x - dx,
+                                 (int32_t)b.origin.y - dy);
+    }
+    CGError err = CGCompleteDisplayConfiguration(cfg, kCGConfigurePermanently);
+    NSLog(@"claimMain: shift arrangement by (%d,%d): %s (err=%d)", -dx, -dy,
+          err == kCGErrorSuccess ? "OK" : "FAILED", err);
+}
+
 static void mirrorNow(void) {
     static BOOL wasOffline = NO;
     CGDirectDisplayID dell = findDell();
@@ -191,9 +220,15 @@ static void mirrorNow(void) {
         return;
     }
     BOOL mirrored = (CGDisplayMirrorsDisplay(dell) == gVirtualID);
+    // NB: CGDisplayCopyDisplayMode can return NULL right after the virtual
+    // display is created (mode not yet published), and also while the
+    // virtual display is the master of a hardware mirror set -- in that
+    // case the Dell reflects the mirror set's mode, so query it instead.
+    CGDisplayModeRef curMode = CGDisplayCopyDisplayMode(gVirtualID);
+    if (!curMode && mirrored) curMode = CGDisplayCopyDisplayMode(dell);
     BOOL rightMode =
-        CGDisplayModeGetPixelWidth((CGDisplayModeRef)CFAutorelease(
-            CGDisplayCopyDisplayMode(gVirtualID))) == 2 * gLW;
+        curMode && CGDisplayModeGetPixelWidth(curMode) == 2 * gLW;
+    if (curMode) CFRelease(curMode);
     if (mirrored && rightMode) return; // nothing to do
     CGDisplayModeRef want = rightMode ? NULL : copyWantedMode();
     NSLog(@"mirrorNow: mirrored=%d rightMode=%d want=%s", mirrored, rightMode,
@@ -220,12 +255,14 @@ static void mirrorNow(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         if (!gVirtual) return;
-        CGDisplayModeRef cur =
-            (CGDisplayModeRef)CFAutorelease(CGDisplayCopyDisplayMode(gVirtualID));
+        claimMain();
+        CGDisplayModeRef cur = CGDisplayCopyDisplayMode(gVirtualID);
         if (!cur) return;
+        CFAutorelease(cur);
         NSLog(@"post-transaction actual mode: %zux%zu points, %zux%zu pixels",
               CGDisplayModeGetWidth(cur), CGDisplayModeGetHeight(cur),
               CGDisplayModeGetPixelWidth(cur), CGDisplayModeGetPixelHeight(cur));
+        claimMain();
     });
 }
 
