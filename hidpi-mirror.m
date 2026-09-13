@@ -54,7 +54,7 @@ static uint32_t gVendor = 4268; // 0x10AC = Dell; override via argv[3]
 static CGVirtualDisplay *gVirtual = nil;  // keep-alive
 static CGDirectDisplayID gVirtualID = 0;
 static unsigned int gLW = 2048, gLH = 1152; // desired "looks like" size
-static volatile BOOL gTearingDown = NO; // we destroy the virtual ourselves
+static unsigned gGeneration = 0; // bumped per virtual-display (re)create
 
 static CGDirectDisplayID findDell(void) {
     CGDirectDisplayID ids[16];
@@ -115,8 +115,11 @@ static BOOL createVirtual(void) {
     desc.vendorID  = 0xB33F;
     desc.productID = 0x2049 + gLW / 16 + gLH; // identity varies per size
     desc.serialNum = 1;
+    unsigned gen = ++gGeneration;
     desc.terminationHandler = ^(id a, id b) {
-        if (gTearingDown) return; // our own teardown, not an external kill
+        // Only react if THIS instance is still the live one; our own
+        // teardown (destroyVirtual) bumps the generation first.
+        if (gen != gGeneration) return;
         NSLog(@"virtual display terminated");
         exit(0);
     };
@@ -161,13 +164,9 @@ static BOOL createVirtual(void) {
 static void destroyVirtual(void) {
     if (!gVirtual) return;
     NSLog(@"physical display gone, tearing down virtual display");
-    gTearingDown = YES;
+    gGeneration++; // invalidate this instance's terminationHandler
     gVirtual = nil; // releasing the object terminates the virtual display
     gVirtualID = 0;
-    // Give WindowServer a beat to process the termination before we could
-    // possibly recreate; the flag is reset asynchronously.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
-                   dispatch_get_main_queue(), ^{ gTearingDown = NO; });
 }
 
 // The virtual display is (re)created on demand, so macOS forgets it was
@@ -262,7 +261,6 @@ static void mirrorNow(void) {
         NSLog(@"post-transaction actual mode: %zux%zu points, %zux%zu pixels",
               CGDisplayModeGetWidth(cur), CGDisplayModeGetHeight(cur),
               CGDisplayModeGetPixelWidth(cur), CGDisplayModeGetPixelHeight(cur));
-        claimMain();
     });
 }
 
