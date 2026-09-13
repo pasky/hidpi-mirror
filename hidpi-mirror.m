@@ -132,8 +132,6 @@ static BOOL createVirtual(void) {
     CGVirtualDisplaySettings *settings =
         [[NSClassFromString(@"CGVirtualDisplaySettings") alloc] init];
     settings.hiDPI = 1;
-    // Offer exactly ONE mode: the desired "looks like" size at 2x.
-    // This way neither macOS nor a stray click can pick a wrong mode.
     Class modeCls = NSClassFromString(@"CGVirtualDisplayMode");
     // WindowServer ignores programmatic mode changes on virtual displays
     // and always runs the PREFERRED (first listed) mode -- so put the
@@ -152,6 +150,9 @@ static BOOL createVirtual(void) {
     settings.modes = modes;
     if (![gVirtual applySettings:settings]) {
         NSLog(@"applySettings failed");
+        // Invalidate first so this failed instance's terminationHandler
+        // doesn't mistake our cleanup for external termination and exit(0).
+        gGeneration++;
         gVirtual = nil;
         gVirtualID = 0;
         return NO;
@@ -213,8 +214,9 @@ static void mirrorNow(void) {
     wasOffline = NO;
     if (!gVirtual) {
         if (!createVirtual()) return; // retry on next poll
-        // Let WindowServer settle before mirroring onto the fresh display.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+        // Let WindowServer settle (publish modes) before mirroring onto
+        // the fresh display.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                        dispatch_get_main_queue(), ^{ mirrorNow(); });
         return;
     }
@@ -251,9 +253,18 @@ static void mirrorNow(void) {
               err == kCGErrorSuccess ? "OK" : "FAILED", err);
     }
     if (want) CFRelease(want);
+    if (err != kCGErrorSuccess) return; // nothing to follow up on
+    unsigned gen = gGeneration;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
-        if (!gVirtual) return;
+        // Only follow up on the SAME virtual display instance we just
+        // configured, and only if the mirror is actually established --
+        // otherwise a stale block could promote an unmirrored virtual
+        // display to main during a disconnect/reconnect shuffle.
+        if (!gVirtual || gen != gGeneration) return;
+        CGDirectDisplayID d = findDell();
+        if (d == kCGNullDirectDisplay ||
+            CGDisplayMirrorsDisplay(d) != gVirtualID) return;
         claimMain();
         CGDisplayModeRef cur = CGDisplayCopyDisplayMode(gVirtualID);
         if (!cur) return;
@@ -319,8 +330,12 @@ int main(int argc, char *argv[]) {
         // across login sessions, so also poll (cheap no-op when all good).
         dispatch_source_t poll = dispatch_source_create(
             DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        // First poll only after 10s: mirrorNow() above already ran, and an
+        // immediate poll would re-enter before the fresh virtual display
+        // has published its modes, mirroring without the atomic mode setup.
         dispatch_source_set_timer(poll,
-                                  dispatch_time(DISPATCH_TIME_NOW, 0),
+                                  dispatch_time(DISPATCH_TIME_NOW,
+                                                10 * NSEC_PER_SEC),
                                   10 * NSEC_PER_SEC, NSEC_PER_SEC);
         dispatch_source_set_event_handler(poll, ^{ mirrorNow(); });
         dispatch_resume(poll);

@@ -38,8 +38,14 @@ clang -fobjc-arc -framework Foundation -framework CoreGraphics \
   `ioreg -lw0 | grep -i DisplayVendorID` or `displayplacer list`).
 - The tool must keep running; on exit (Ctrl-C/SIGTERM) the physical
   display reverts to normal.
-- Survives KVM/cable disconnects: it re-establishes the mirror whenever
-  the display reappears.
+- Survives KVM/cable disconnects: the virtual display is created on
+  demand and torn down while the physical display is offline (so no
+  invisible screen estate collects your windows), and the mirror is
+  re-established whenever the display reappears.
+- Opinionated: whenever the mirror is (re)established, the mirror set is
+  made the **main display** (arrangement is translated, relative display
+  positions are preserved). Manual rearranging afterwards is respected
+  until the next reconnect.
 
 ### Run at login
 
