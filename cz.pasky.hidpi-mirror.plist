@@ -15,6 +15,10 @@
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
+	<!-- Exempt from background throttling / App Nap: the display watchdog
+	     poll must keep running even after days of idling and sleep. -->
+	<key>ProcessType</key>
+	<string>Interactive</string>
 	<key>KeepAlive</key>
 	<true/>
 	<key>LimitLoadToSessionType</key>

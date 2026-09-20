@@ -312,6 +312,18 @@ int main(int argc, char *argv[]) {
               @"created on demand when physical display is online",
               gLW, gLH, gLW * 2, gLH * 2);
 
+
+        // Opt out of App Nap: as a windowless background agent we are a
+        // prime timer-coalescing victim -- observed in the wild as the 10s
+        // poll silently never firing again after days of sleep/wake cycles,
+        // leaving a phantom virtual display behind when the physical
+        // display disconnected. (Also: ProcessType=Interactive in the
+        // launchd plist, and DISPATCH_TIMER_STRICT below.)
+        static id activity; // hold the assertion for process lifetime
+        activity = [[NSProcessInfo processInfo]
+            beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
+                              reason:@"display watchdog must keep polling"];
+
         signal(SIGINT, SIG_IGN);
         signal(SIGTERM, SIG_IGN);
         dispatch_source_t sigint = dispatch_source_create(
@@ -328,8 +340,11 @@ int main(int argc, char *argv[]) {
         mirrorNow();
         // Belt and braces: reconfiguration callbacks have proven flaky
         // across login sessions, so also poll (cheap no-op when all good).
+        // DISPATCH_TIMER_STRICT: no coalescing/deferral -- see App Nap
+        // note above; a lazily-coalesced watchdog is no watchdog.
         dispatch_source_t poll = dispatch_source_create(
-            DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+            DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT,
+            dispatch_get_main_queue());
         // First poll only after 10s: mirrorNow() above already ran, and an
         // immediate poll would re-enter before the fresh virtual display
         // has published its modes, mirroring without the atomic mode setup.
