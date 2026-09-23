@@ -15,6 +15,8 @@
 #import <mach-o/dyld.h>
 #import <spawn.h>
 #import <sys/wait.h>
+#import <poll.h>
+#import <fcntl.h>
 
 extern char **environ;
 
@@ -61,6 +63,7 @@ static CGDirectDisplayID gVirtualID = 0;
 static unsigned int gLW = 2048, gLH = 1152; // desired "looks like" size
 static unsigned gGeneration = 0; // bumped per virtual-display (re)create
 static char gSelfPath[PATH_MAX]; // own executable, for --probe children
+static unsigned gTopoEpoch = 0; // bumped on any display topology activity
 
 static CGDirectDisplayID findDell(void) {
     CGDirectDisplayID ids[16];
@@ -122,6 +125,7 @@ static BOOL createVirtual(void) {
     desc.productID = 0x2049 + gLW / 16 + gLH; // identity varies per size
     desc.serialNum = 1;
     unsigned gen = ++gGeneration;
+    gTopoEpoch++;
     desc.terminationHandler = ^(id a, id b) {
         // Only react if THIS instance is still the live one; our own
         // teardown (destroyVirtual) bumps the generation first.
@@ -172,6 +176,7 @@ static void destroyVirtual(void) {
     if (!gVirtual) return;
     NSLog(@"physical display gone, tearing down virtual display");
     gGeneration++; // invalidate this instance's terminationHandler
+    gTopoEpoch++;
     gVirtual = nil; // releasing the object terminates the virtual display
     gVirtualID = 0;
 }
@@ -301,7 +306,7 @@ static void unmirror(void) {
 // process saw the truth. So periodically ask a fresh copy of ourselves
 // (--probe) for the online display list and compare.
 
-// Sorted online display IDs, e.g. "1,4,61"; nil on error.
+// Sorted online display IDs, e.g. "[1,4,61]" ("[]" if none); nil on error.
 static NSString *onlineSignature(void) {
     CGDirectDisplayID ids[16];
     uint32_t n = 0;
@@ -309,60 +314,112 @@ static NSString *onlineSignature(void) {
     NSMutableArray *a = [NSMutableArray array];
     for (uint32_t i = 0; i < n; i++) [a addObject:@(ids[i])];
     [a sortUsingSelector:@selector(compare:)];
-    return [a componentsJoinedByString:@","];
+    return [NSString stringWithFormat:@"[%@]",
+                                      [a componentsJoinedByString:@","]];
 }
 
-// Run `self --probe`, return its signature; nil on any failure. Blocking --
-// call off the main thread.
+#define PROBE_TIMEOUT_MS 5000
+
+// Run `self --probe`, return its signature; nil on any failure (incl.
+// timeout -- the child is SIGKILLed and reaped). Blocking -- call off the
+// main thread.
 static NSString *runProbe(void) {
     int fds[2];
     if (pipe(fds) != 0) return nil;
     posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
-    posix_spawn_file_actions_addclose(&fa, fds[0]);
-    posix_spawn_file_actions_addclose(&fa, fds[1]);
+    posix_spawnattr_t attr;
+    BOOL ok = posix_spawn_file_actions_init(&fa) == 0;
+    if (!ok) { close(fds[0]); close(fds[1]); return nil; }
+    ok = posix_spawnattr_init(&attr) == 0;
+    if (!ok) {
+        posix_spawn_file_actions_destroy(&fa);
+        close(fds[0]); close(fds[1]);
+        return nil;
+    }
+    // fds 0-2 are guaranteed open (see main), so pipe fds are > 2 and
+    // the dup2 below can't collide with them.
+    ok = posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO) == 0 &&
+         posix_spawn_file_actions_addclose(&fa, fds[0]) == 0 &&
+         posix_spawn_file_actions_addclose(&fa, fds[1]) == 0;
+    // We SIG_IGN SIGINT/SIGTERM; don't let the child inherit that.
+    sigset_t def, none;
+    sigemptyset(&def); sigaddset(&def, SIGINT); sigaddset(&def, SIGTERM);
+    sigemptyset(&none);
+    ok = ok && posix_spawnattr_setsigdefault(&attr, &def) == 0 &&
+         posix_spawnattr_setsigmask(&attr, &none) == 0 &&
+         posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF |
+                                             POSIX_SPAWN_SETSIGMASK) == 0;
+    pid_t pid = -1;
     char *args[] = {gSelfPath, "--probe", NULL};
-    pid_t pid;
-    int rc = posix_spawn(&pid, gSelfPath, &fa, NULL, args, environ);
+    int rc = ok ? posix_spawn(&pid, gSelfPath, &fa, &attr, args, environ)
+                : -1;
     posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
     close(fds[1]);
     if (rc != 0) { close(fds[0]); return nil; }
+
     char buf[512];
     size_t len = 0;
-    ssize_t r;
-    while (len < sizeof(buf) - 1 &&
-           (r = read(fds[0], buf + len, sizeof(buf) - 1 - len)) > 0)
+    BOOL good = YES;
+    uint64_t deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC) +
+                        (uint64_t)PROBE_TIMEOUT_MS * NSEC_PER_MSEC;
+    for (;;) {
+        uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+        if (now >= deadline) { good = NO; break; } // hung child
+        struct pollfd pfd = {.fd = fds[0], .events = POLLIN};
+        int pr = poll(&pfd, 1, (int)((deadline - now) / NSEC_PER_MSEC) + 1);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr < 0) { good = NO; break; }
+        if (pr == 0) continue; // re-check deadline
+        if (len >= sizeof(buf) - 1) { good = NO; break; } // garbage
+        ssize_t r = read(fds[0], buf + len, sizeof(buf) - 1 - len);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) { good = NO; break; }
+        if (r == 0) break; // EOF
         len += (size_t)r;
+    }
     close(fds[0]);
-    int st;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return nil;
+    if (!good) kill(pid, SIGKILL);
+    int st = 0;
+    pid_t w;
+    while ((w = waitpid(pid, &st, 0)) < 0 && errno == EINTR) {}
+    if (!good || w != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0)
+        return nil;
     buf[len] = 0;
     NSString *s = [[NSString stringWithUTF8String:buf]
         stringByTrimmingCharactersInSet:
             [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    return s.length ? s : nil;
+    // Must be a well-formed signature ("[]" is valid: nothing online).
+    return [s hasPrefix:@"["] && [s hasSuffix:@"]"] ? s : nil;
 }
 
 static void probeTick(void) {
     static BOOL inFlight = NO;
     static int strikes = 0;
     if (inFlight || !gSelfPath[0]) return;
+    // Snapshot our view and the topology epoch before AND after the probe;
+    // only a sample during which nothing changed (no reconfiguration
+    // callback, no virtual display create/destroy, same view) counts. A
+    // truly stale view gets no callbacks, so this doesn't mask it.
+    NSString *before = onlineSignature();
+    unsigned epoch = gTopoEpoch;
+    if (!before) { strikes = 0; return; }
     inFlight = YES;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSString *fresh = runProbe();
         dispatch_async(dispatch_get_main_queue(), ^{
             inFlight = NO;
-            NSString *ours = onlineSignature();
-            if (!fresh || !ours) return; // inconclusive, don't act
-            if ([fresh isEqualToString:ours]) { strikes = 0; return; }
-            // Require consecutive mismatches: a single one may just be a
-            // reconfiguration racing between the two queries.
+            NSString *after = onlineSignature();
+            if (!fresh || !after || ![after isEqualToString:before] ||
+                epoch != gTopoEpoch) {
+                strikes = 0; // inconclusive: need consecutive clean evidence
+                return;
+            }
+            if ([fresh isEqualToString:after]) { strikes = 0; return; }
             strikes++;
-            NSLog(@"display list mismatch (strike %d): ours=[%@] fresh=[%@]",
-                  strikes, ours, fresh);
-            if (strikes < 2) return;
+            NSLog(@"display list mismatch (strike %d): ours=%@ fresh=%@",
+                  strikes, after, fresh);
+            if (strikes < 3) return;
             // Our view is stale; act on nothing it says (no unmirror). Dying
             // drops the virtual display; launchd (KeepAlive) restarts us
             // with a fresh WindowServer connection.
@@ -374,6 +431,7 @@ static void probeTick(void) {
 
 static void reconfigCB(CGDirectDisplayID d, CGDisplayChangeSummaryFlags flags,
                        void *userInfo) {
+    gTopoEpoch++; // invalidates in-flight stale-state probes
     if (flags & (kCGDisplayAddFlag | kCGDisplayRemoveFlag)) {
         // Display (dis)appeared -- e.g. KVM switch. Give WindowServer
         // a moment to settle, then re-establish (or tear down) the mirror.
@@ -390,6 +448,10 @@ int main(int argc, char *argv[]) {
             printf("%s\n", sig.UTF8String);
             return 0;
         }
+        // Ensure fds 0-2 are open, so later pipe() fds never alias stdio.
+        for (int fd = 0; fd <= 2; fd++)
+            if (fcntl(fd, F_GETFD) < 0 && errno == EBADF)
+                open("/dev/null", O_RDWR);
         uint32_t pathSize = sizeof(gSelfPath);
         if (_NSGetExecutablePath(gSelfPath, &pathSize) != 0) gSelfPath[0] = 0;
         if (!NSClassFromString(@"CGVirtualDisplayDescriptor")) {
