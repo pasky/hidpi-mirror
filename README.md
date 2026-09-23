@@ -42,6 +42,12 @@ clang -fobjc-arc -framework Foundation -framework CoreGraphics \
   demand and torn down while the physical display is offline (so no
   invisible screen estate collects your windows), and the mirror is
   re-established whenever the display reappears.
+- Self-healing: a long-lived process's CoreGraphics display state can go
+  stale (observed after days of sleep/wake/KVM cycles: a long-gone
+  display still listed as online, no reconfiguration callbacks). Every
+  30s the tool compares its view with a fresh `hidpi-mirror --probe`
+  child; on persistent mismatch it exits, relying on launchd's
+  `KeepAlive` to restart it (so prefer running it via the plist below).
 - Opinionated: whenever the mirror is (re)established, the mirror set is
   made the **main display** (arrangement is translated, relative display
   positions are preserved). Manual rearranging afterwards is respected

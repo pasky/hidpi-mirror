@@ -12,6 +12,11 @@
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <mach-o/dyld.h>
+#import <spawn.h>
+#import <sys/wait.h>
+
+extern char **environ;
 
 // ---- Private CoreGraphics API declarations (typing only; classes are
 // ---- instantiated via NSClassFromString so we don't need link symbols) ----
@@ -55,6 +60,7 @@ static CGVirtualDisplay *gVirtual = nil;  // keep-alive
 static CGDirectDisplayID gVirtualID = 0;
 static unsigned int gLW = 2048, gLH = 1152; // desired "looks like" size
 static unsigned gGeneration = 0; // bumped per virtual-display (re)create
+static char gSelfPath[PATH_MAX]; // own executable, for --probe children
 
 static CGDirectDisplayID findDell(void) {
     CGDirectDisplayID ids[16];
@@ -286,6 +292,86 @@ static void unmirror(void) {
     NSLog(@"unmirrored");
 }
 
+// ---- Stale-state watchdog ----
+// Observed in the wild: after days of sleep/wake/KVM cycles, this process's
+// CoreGraphics display cache froze -- CGGetOnlineDisplayList kept listing
+// the long-gone Dell as online and mirrored (and no reconfiguration
+// callbacks arrived), so every poll took the silent "all good" path and
+// the orphaned virtual display lingered as invisible screen estate. A fresh
+// process saw the truth. So periodically ask a fresh copy of ourselves
+// (--probe) for the online display list and compare.
+
+// Sorted online display IDs, e.g. "1,4,61"; nil on error.
+static NSString *onlineSignature(void) {
+    CGDirectDisplayID ids[16];
+    uint32_t n = 0;
+    if (CGGetOnlineDisplayList(16, ids, &n) != kCGErrorSuccess) return nil;
+    NSMutableArray *a = [NSMutableArray array];
+    for (uint32_t i = 0; i < n; i++) [a addObject:@(ids[i])];
+    [a sortUsingSelector:@selector(compare:)];
+    return [a componentsJoinedByString:@","];
+}
+
+// Run `self --probe`, return its signature; nil on any failure. Blocking --
+// call off the main thread.
+static NSString *runProbe(void) {
+    int fds[2];
+    if (pipe(fds) != 0) return nil;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&fa, fds[0]);
+    posix_spawn_file_actions_addclose(&fa, fds[1]);
+    char *args[] = {gSelfPath, "--probe", NULL};
+    pid_t pid;
+    int rc = posix_spawn(&pid, gSelfPath, &fa, NULL, args, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fds[1]);
+    if (rc != 0) { close(fds[0]); return nil; }
+    char buf[512];
+    size_t len = 0;
+    ssize_t r;
+    while (len < sizeof(buf) - 1 &&
+           (r = read(fds[0], buf + len, sizeof(buf) - 1 - len)) > 0)
+        len += (size_t)r;
+    close(fds[0]);
+    int st;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return nil;
+    buf[len] = 0;
+    NSString *s = [[NSString stringWithUTF8String:buf]
+        stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return s.length ? s : nil;
+}
+
+static void probeTick(void) {
+    static BOOL inFlight = NO;
+    static int strikes = 0;
+    if (inFlight || !gSelfPath[0]) return;
+    inFlight = YES;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSString *fresh = runProbe();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            inFlight = NO;
+            NSString *ours = onlineSignature();
+            if (!fresh || !ours) return; // inconclusive, don't act
+            if ([fresh isEqualToString:ours]) { strikes = 0; return; }
+            // Require consecutive mismatches: a single one may just be a
+            // reconfiguration racing between the two queries.
+            strikes++;
+            NSLog(@"display list mismatch (strike %d): ours=[%@] fresh=[%@]",
+                  strikes, ours, fresh);
+            if (strikes < 2) return;
+            // Our view is stale; act on nothing it says (no unmirror). Dying
+            // drops the virtual display; launchd (KeepAlive) restarts us
+            // with a fresh WindowServer connection.
+            NSLog(@"CoreGraphics state is stale, exiting for a clean restart");
+            exit(2);
+        });
+    });
+}
+
 static void reconfigCB(CGDirectDisplayID d, CGDisplayChangeSummaryFlags flags,
                        void *userInfo) {
     if (flags & (kCGDisplayAddFlag | kCGDisplayRemoveFlag)) {
@@ -298,6 +384,14 @@ static void reconfigCB(CGDirectDisplayID d, CGDisplayChangeSummaryFlags flags,
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
+        if (argc == 2 && strcmp(argv[1], "--probe") == 0) {
+            NSString *sig = onlineSignature();
+            if (!sig) return 1;
+            printf("%s\n", sig.UTF8String);
+            return 0;
+        }
+        uint32_t pathSize = sizeof(gSelfPath);
+        if (_NSGetExecutablePath(gSelfPath, &pathSize) != 0) gSelfPath[0] = 0;
         if (!NSClassFromString(@"CGVirtualDisplayDescriptor")) {
             NSLog(@"CGVirtualDisplay API unavailable");
             return 1;
@@ -354,6 +448,16 @@ int main(int argc, char *argv[]) {
                                   10 * NSEC_PER_SEC, NSEC_PER_SEC);
         dispatch_source_set_event_handler(poll, ^{ mirrorNow(); });
         dispatch_resume(poll);
+        // Stale-state watchdog (see probeTick): cheap (~25ms, 4ms CPU).
+        dispatch_source_t probe = dispatch_source_create(
+            DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT,
+            dispatch_get_main_queue());
+        dispatch_source_set_timer(probe,
+                                  dispatch_time(DISPATCH_TIME_NOW,
+                                                30 * NSEC_PER_SEC),
+                                  30 * NSEC_PER_SEC, 5 * NSEC_PER_SEC);
+        dispatch_source_set_event_handler(probe, ^{ probeTick(); });
+        dispatch_resume(probe);
         // NB: must be CFRunLoopRun, NOT dispatch_main() --
         // CGDisplayRegisterReconfigurationCallback delivers via CFRunLoop
         // (and the main runloop drains the main GCD queue too).
