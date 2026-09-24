@@ -12,6 +12,7 @@
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <IOKit/IOKitLib.h>
 
 // ---- Private CoreGraphics API declarations (typing only; classes are
 // ---- instantiated via NSClassFromString so we don't need link symbols) ----
@@ -170,6 +171,47 @@ static void destroyVirtual(void) {
     gVirtualID = 0;
 }
 
+// ---- Kernel-level external video link detection (IOKit) ----
+// This process's CoreGraphics view can go stale (observed: after a
+// disconnect it kept listing the Dell as online and mirrored, with no
+// reconfiguration callback), leaving the virtual display as an invisible
+// main display. The display coprocessor publishes a DCPAVVideoInterfaceProxy
+// with Location=External exactly while an external video link is up; IOKit
+// state comes from the kernel and can't go stale, and its match/terminate
+// notifications are instant.
+
+static CFMutableDictionaryRef externalLinkMatching(void) {
+    CFMutableDictionaryRef m = IOServiceMatching("DCPAVVideoInterfaceProxy");
+    if (!m) return NULL;
+    CFMutableDictionaryRef props = CFDictionaryCreateMutable(
+        NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    CFDictionarySetValue(props, CFSTR("Location"), CFSTR("External"));
+    CFDictionarySetValue(m, CFSTR(kIOPropertyMatchKey), props);
+    CFRelease(props);
+    return m;
+}
+
+// NO only when IOKit positively reports no external video link; on any
+// IOKit error assume YES (i.e. fall back to trusting CoreGraphics).
+static BOOL externalLinkUp(void) {
+    CFMutableDictionaryRef m = externalLinkMatching();
+    if (!m) return YES;
+    io_iterator_t it = IO_OBJECT_NULL;
+    // IOServiceGetMatchingServices consumes the matching dictionary.
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, m, &it) !=
+        KERN_SUCCESS)
+        return YES;
+    BOOL any = NO;
+    io_object_t o;
+    while ((o = IOIteratorNext(it))) {
+        any = YES;
+        IOObjectRelease(o);
+    }
+    IOObjectRelease(it);
+    return any;
+}
+
 // The virtual display is (re)created on demand, so macOS forgets it was
 // the main display across reconnects; the display whose origin is (0,0)
 // becomes main -- reclaim it for the mirror set. Must run as a separate
@@ -199,8 +241,30 @@ static void claimMain(void) {
           err == kCGErrorSuccess ? "OK" : "FAILED", err);
 }
 
+// Run `action` as soon as `ready` holds (checked every 250ms), but after
+// at most `tries` checks regardless -- i.e. never later than the fixed
+// delays this replaces. Aborts if the virtual display instance changes.
+static void whenReady(int tries, BOOL (^ready)(void), void (^action)(void)) {
+    unsigned gen = gGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 4),
+                   dispatch_get_main_queue(), ^{
+        if (!gVirtual || gen != gGeneration) return;
+        if (tries <= 1 || ready()) action();
+        else whenReady(tries - 1, ready, action);
+    });
+}
+
 static void mirrorNow(void) {
     static BOOL wasOffline = NO;
+    if (!externalLinkUp()) {
+        // Kernel says no external video link: the physical display is gone,
+        // whatever our (possibly stale) CoreGraphics view claims.
+        if (!wasOffline)
+            NSLog(@"no external video link (IOKit), waiting...");
+        wasOffline = YES;
+        destroyVirtual();
+        return;
+    }
     CGDirectDisplayID dell = findDell();
     if (dell == kCGNullDirectDisplay) {
         if (!wasOffline)
@@ -215,9 +279,14 @@ static void mirrorNow(void) {
     if (!gVirtual) {
         if (!createVirtual()) return; // retry on next poll
         // Let WindowServer settle (publish modes) before mirroring onto
-        // the fresh display.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
-                       dispatch_get_main_queue(), ^{ mirrorNow(); });
+        // the fresh display -- proceed as soon as the wanted HiDPI mode is
+        // published, or after 2s at the latest (as before).
+        whenReady(8, ^BOOL { // quiet check: modes published yet?
+            CFArrayRef modes = CGDisplayCopyAllDisplayModes(gVirtualID, NULL);
+            CFIndex n = modes ? CFArrayGetCount(modes) : 0;
+            if (modes) CFRelease(modes);
+            return n > 0;
+        }, ^{ mirrorNow(); });
         return;
     }
     BOOL mirrored = (CGDisplayMirrorsDisplay(dell) == gVirtualID);
@@ -262,8 +331,12 @@ static void mirrorNow(void) {
     if (want) CFRelease(want);
     if (err != kCGErrorSuccess) return; // nothing to follow up on
     unsigned gen = gGeneration;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
-                   dispatch_get_main_queue(), ^{
+    // Follow up as soon as the mirror is established (2s at the latest).
+    whenReady(8, ^BOOL {
+        CGDirectDisplayID d = findDell();
+        return d != kCGNullDirectDisplay &&
+               CGDisplayMirrorsDisplay(d) == gVirtualID;
+    }, ^{
         // Only follow up on the SAME virtual display instance we just
         // configured, and only if the mirror is actually established --
         // otherwise a stale block could promote an unmirrored virtual
@@ -303,6 +376,50 @@ static void reconfigCB(CGDirectDisplayID d, CGDisplayChangeSummaryFlags flags,
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                        dispatch_get_main_queue(), ^{ mirrorNow(); });
     }
+}
+
+// Link came up: act as soon as CoreGraphics brings the display online,
+// instead of waiting for a (possibly missing) reconfiguration callback or
+// the 10s poll. Calls mirrorNow() exactly once.
+static void mirrorWhenOnline(int triesLeft) {
+    if (findDell() != kCGNullDirectDisplay || triesLeft <= 0) {
+        mirrorNow();
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 4),
+                   dispatch_get_main_queue(),
+                   ^{ mirrorWhenOnline(triesLeft - 1); });
+}
+
+// Link went away but CoreGraphics still lists the display: our CG view is
+// stale and won't recover in-process. Nothing is displayed via the virtual
+// display anymore, so a restart (launchd KeepAlive) is harmless.
+static void checkStaleAfterLinkDown(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        if (externalLinkUp() || findDell() == kCGNullDirectDisplay) return;
+        NSLog(@"external link gone (IOKit) but CoreGraphics still lists the "
+              @"display: stale CG state, exiting for a clean restart");
+        exit(2);
+    });
+}
+
+static void drainIterator(io_iterator_t it) {
+    io_object_t o;
+    while ((o = IOIteratorNext(it))) IOObjectRelease(o);
+}
+
+static void linkAppeared(void *refcon, io_iterator_t it) {
+    drainIterator(it); // also re-arms the notification
+    NSLog(@"external video link up (IOKit)");
+    mirrorWhenOnline(40); // up to 10s
+}
+
+static void linkGone(void *refcon, io_iterator_t it) {
+    drainIterator(it);
+    NSLog(@"external video link down (IOKit)");
+    mirrorNow(); // tears down the virtual display immediately
+    checkStaleAfterLinkDown();
 }
 
 int main(int argc, char *argv[]) {
@@ -346,6 +463,26 @@ int main(int argc, char *argv[]) {
         dispatch_resume(sigterm);
 
         CGDisplayRegisterReconfigurationCallback(reconfigCB, NULL);
+        // Instant, never-stale external link (dis)connect events.
+        IONotificationPortRef np = IONotificationPortCreate(kIOMainPortDefault);
+        CFRunLoopAddSource(CFRunLoopGetMain(),
+                           IONotificationPortGetRunLoopSource(np),
+                           kCFRunLoopDefaultMode);
+        static io_iterator_t upIt, downIt; // live for process lifetime
+        if (IOServiceAddMatchingNotification(np, kIOFirstMatchNotification,
+                                             externalLinkMatching(),
+                                             linkAppeared, NULL,
+                                             &upIt) == KERN_SUCCESS)
+            drainIterator(upIt); // arm; current state handled below
+        else
+            NSLog(@"IOKit link-up notification unavailable");
+        if (IOServiceAddMatchingNotification(np, kIOTerminatedNotification,
+                                             externalLinkMatching(),
+                                             linkGone, NULL,
+                                             &downIt) == KERN_SUCCESS)
+            drainIterator(downIt);
+        else
+            NSLog(@"IOKit link-down notification unavailable");
         mirrorNow();
         // Belt and braces: reconfiguration callbacks have proven flaky
         // across login sessions, so also poll (cheap no-op when all good).

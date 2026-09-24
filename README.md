@@ -22,7 +22,7 @@ Tested on macOS 26 (Apple Silicon).
 ## Build
 
 ```sh
-clang -fobjc-arc -framework Foundation -framework CoreGraphics \
+clang -fobjc-arc -framework Foundation -framework CoreGraphics -framework IOKit \
       -o hidpi-mirror hidpi-mirror.m
 ```
 
