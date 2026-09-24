@@ -46,9 +46,8 @@ clang -fobjc-arc -framework Foundation -framework CoreGraphics \
   stale (observed after days of sleep/wake/KVM cycles: a long-gone
   display still listed as online, no reconfiguration callbacks). Every
   30s the tool compares its view with a fresh `hidpi-mirror --probe`
-  child; on persistent mismatch (3 consecutive clean samples) it exits,
-  relying on launchd's `KeepAlive` to restart it (so prefer running it
-  via the plist below).
+  child; on persistent mismatch it exits, relying on launchd's
+  `KeepAlive` to restart it (so prefer running it via the plist below).
 - Opinionated: whenever the mirror is (re)established, the mirror set is
   made the **main display** (arrangement is translated, relative display
   positions are preserved). Manual rearranging afterwards is respected
