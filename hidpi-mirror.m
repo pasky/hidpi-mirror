@@ -241,7 +241,14 @@ static void mirrorNow(void) {
     BOOL rightMode =
         curMode && CGDisplayModeGetPixelWidth(curMode) == 2 * gLW;
     if (curMode) CFRelease(curMode);
-    if (mirrored && rightMode) return; // nothing to do
+    if (mirrored && rightMode) {
+        // WindowServer may restore the mirror on its own from a saved
+        // arrangement (e.g. on reconnect), skipping our transaction and
+        // its claimMain follow-up -- so ensure the main role here too.
+        // No-op (no reconfiguration) when the virtual is already main.
+        claimMain();
+        return;
+    }
     CGDisplayModeRef want = rightMode ? NULL : copyWantedMode();
     NSLog(@"mirrorNow: mirrored=%d rightMode=%d want=%s", mirrored, rightMode,
           want ? "found" : "NULL");
@@ -293,7 +300,9 @@ static void unmirror(void) {
     CGDisplayConfigRef cfg;
     CGBeginDisplayConfiguration(&cfg);
     CGConfigureDisplayMirrorOfDisplay(cfg, dell, kCGNullDirectDisplay);
-    CGCompleteDisplayConfiguration(cfg, kCGConfigurePermanently);
+    // Session only: a stop/restart of this agent must not persist an
+    // unmirrored arrangement that WindowServer would later restore.
+    CGCompleteDisplayConfiguration(cfg, kCGConfigureForSession);
     NSLog(@"unmirrored");
 }
 
