@@ -315,6 +315,10 @@ static void mirrorNow(void) {
     CGConfigureOption options[] = {kCGConfigureForSession,
                                    kCGConfigurePermanently};
     for (int i = 0; i < 2 && err != kCGErrorSuccess; i++) {
+        // A failing transaction can block for 10s+ (observed: 10s, then
+        // 70s) while the display is going away; don't retry into a gone
+        // link -- the main thread must stay free for IOKit/CG events.
+        if (i > 0 && !externalLinkUp()) break;
         CGDisplayConfigRef cfg;
         CGBeginDisplayConfiguration(&cfg);
         if (want) {
@@ -394,6 +398,31 @@ static void mirrorWhenOnline(int triesLeft) {
 // Link went away but CoreGraphics still lists the display: our CG view is
 // stale and won't recover in-process. Nothing is displayed via the virtual
 // display anymore, so a restart (launchd KeepAlive) is harmless.
+// Any online display that is neither built-in nor a virtual one of ours.
+static BOOL cgSeesExternal(void) {
+    CGDirectDisplayID ids[16];
+    uint32_t n = 0;
+    if (CGGetOnlineDisplayList(16, ids, &n) != kCGErrorSuccess) return YES;
+    for (uint32_t i = 0; i < n; i++)
+        if (!CGDisplayIsBuiltin(ids[i]) && CGDisplayVendorNumber(ids[i]) != 0xB33F)
+            return YES;
+    return NO;
+}
+
+// Mirror image of checkStaleAfterLinkDown: link came up (observed: Dell
+// replugged into another port) but our CG view never shows ANY external
+// display, so mirrorNow() silently keeps waiting. Checked once per link-up
+// event (never at startup), so a restart can't loop.
+static void checkStaleAfterLinkUp(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        if (!externalLinkUp() || cgSeesExternal()) return;
+        NSLog(@"external link up (IOKit) but CoreGraphics lists no external "
+              @"display: stale CG state, exiting for a clean restart");
+        exit(2);
+    });
+}
+
 static void checkStaleAfterLinkDown(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
@@ -413,6 +442,7 @@ static void linkAppeared(void *refcon, io_iterator_t it) {
     drainIterator(it); // also re-arms the notification
     NSLog(@"external video link up (IOKit)");
     mirrorWhenOnline(40); // up to 10s
+    checkStaleAfterLinkUp();
 }
 
 static void linkGone(void *refcon, io_iterator_t it) {
