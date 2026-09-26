@@ -94,8 +94,29 @@ static CGDisplayModeRef copyWantedMode(void) {
     return want;
 }
 
+// YES unless some physical (non-virtual) online display is awake. While
+// the displays sleep (incl. dark wakes), WindowServer reports the Dell as
+// unmirrored, but can't reconfigure anything: transactions block 10s+
+// and fail (err 1014), often spanning system sleep. It restores the
+// saved arrangement on wake by itself, so just stay out of its way.
+static BOOL displaysAsleep(void) {
+    CGDirectDisplayID ids[16];
+    uint32_t n = 0;
+    if (CGGetOnlineDisplayList(16, ids, &n) != kCGErrorSuccess) return YES;
+    for (uint32_t i = 0; i < n; i++)
+        if (ids[i] != gVirtualID && !CGDisplayIsAsleep(ids[i])) return NO;
+    return YES;
+}
+
 static void mirrorNow(void) {
-    static BOOL wasOffline = NO;
+    static BOOL wasOffline = NO, wasAsleep = NO;
+    if (displaysAsleep()) {
+        if (!wasAsleep) NSLog(@"displays asleep, leaving configuration alone");
+        wasAsleep = YES;
+        return;
+    }
+    if (wasAsleep) NSLog(@"displays awake");
+    wasAsleep = NO;
     CGDirectDisplayID dell = findDell();
     if (dell == kCGNullDirectDisplay) {
         if (!wasOffline)
