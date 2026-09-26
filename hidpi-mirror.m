@@ -105,9 +105,14 @@ static void mirrorNow(void) {
     }
     wasOffline = NO;
     BOOL mirrored = (CGDisplayMirrorsDisplay(dell) == gVirtualID);
+    // NB: CGDisplayCopyDisplayMode can return NULL (CFAutorelease(NULL)
+    // would crash), e.g. while the virtual display is the master of a
+    // hardware mirror set -- then the Dell reflects the set's mode.
+    CGDisplayModeRef curMode = CGDisplayCopyDisplayMode(gVirtualID);
+    if (!curMode && mirrored) curMode = CGDisplayCopyDisplayMode(dell);
     BOOL rightMode =
-        CGDisplayModeGetPixelWidth((CGDisplayModeRef)CFAutorelease(
-            CGDisplayCopyDisplayMode(gVirtualID))) == 2 * gLW;
+        curMode && CGDisplayModeGetPixelWidth(curMode) == 2 * gLW;
+    if (curMode) CFRelease(curMode);
     if (mirrored && rightMode) return; // nothing to do
     CGDisplayModeRef want = rightMode ? NULL : copyWantedMode();
     NSLog(@"mirrorNow: mirrored=%d rightMode=%d want=%s", mirrored, rightMode,
@@ -133,8 +138,9 @@ static void mirrorNow(void) {
     if (want) CFRelease(want);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
-        CGDisplayModeRef cur =
-            (CGDisplayModeRef)CFAutorelease(CGDisplayCopyDisplayMode(gVirtualID));
+        CGDisplayModeRef cur = CGDisplayCopyDisplayMode(gVirtualID);
+        if (!cur) return;
+        CFAutorelease(cur);
         NSLog(@"post-transaction actual mode: %zux%zu points, %zux%zu pixels",
               CGDisplayModeGetWidth(cur), CGDisplayModeGetHeight(cur),
               CGDisplayModeGetPixelWidth(cur), CGDisplayModeGetPixelHeight(cur));
@@ -148,7 +154,9 @@ static void unmirror(void) {
     CGDisplayConfigRef cfg;
     CGBeginDisplayConfiguration(&cfg);
     CGConfigureDisplayMirrorOfDisplay(cfg, dell, kCGNullDirectDisplay);
-    CGCompleteDisplayConfiguration(cfg, kCGConfigurePermanently);
+    // Session only: a stop/restart of this agent must not persist an
+    // unmirrored arrangement that WindowServer would later restore.
+    CGCompleteDisplayConfiguration(cfg, kCGConfigureForSession);
     NSLog(@"unmirrored");
 }
 
@@ -230,6 +238,16 @@ int main(int argc, char *argv[]) {
         }
         NSLog(@"virtual display up, id=%u", gVirtualID);
 
+        // Opt out of App Nap: as a windowless background agent we are a
+        // prime timer-coalescing victim -- observed in the wild as the 10s
+        // poll silently never firing again after days of sleep/wake
+        // cycles. (Also: ProcessType=Interactive in the launchd plist,
+        // and DISPATCH_TIMER_STRICT below.)
+        static id activity; // hold the assertion for process lifetime
+        activity = [[NSProcessInfo processInfo]
+            beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
+                              reason:@"display watchdog must keep polling"];
+
         signal(SIGINT, SIG_IGN);
         signal(SIGTERM, SIG_IGN);
         dispatch_source_t sigint = dispatch_source_create(
@@ -247,7 +265,8 @@ int main(int argc, char *argv[]) {
         // Belt and braces: reconfiguration callbacks have proven flaky
         // across login sessions, so also poll (cheap no-op when all good).
         dispatch_source_t poll = dispatch_source_create(
-            DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+            DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT,
+            dispatch_get_main_queue());
         dispatch_source_set_timer(poll,
                                   dispatch_time(DISPATCH_TIME_NOW, 0),
                                   10 * NSEC_PER_SEC, NSEC_PER_SEC);
