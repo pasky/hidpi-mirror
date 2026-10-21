@@ -108,6 +108,33 @@ static BOOL displaysAsleep(void) {
     return YES;
 }
 
+// When WindowServer fails to restore the saved arrangement and we have to
+// re-establish the mirror ourselves (e.g. after a messy reconnect with
+// err 1014 transactions), the built-in display ends up main -- reclaim
+// the main role for the mirror set. Translate the WHOLE arrangement so
+// the virtual display lands on (0,0): setting just one display's origin
+// is silently normalized away. Separate transaction after the mirror.
+static void claimMain(void) {
+    CGRect vb = CGDisplayBounds(gVirtualID);
+    int32_t dx = (int32_t)vb.origin.x, dy = (int32_t)vb.origin.y;
+    if (dx == 0 && dy == 0) return; // already main
+    CGDirectDisplayID ids[16];
+    uint32_t n = 0;
+    if (CGGetOnlineDisplayList(16, ids, &n) != kCGErrorSuccess) return;
+    CGDisplayConfigRef cfg;
+    CGBeginDisplayConfiguration(&cfg);
+    for (uint32_t i = 0; i < n; i++) {
+        if (CGDisplayMirrorsDisplay(ids[i]) != kCGNullDirectDisplay)
+            continue; // mirror followers inherit their master's origin
+        CGRect b = CGDisplayBounds(ids[i]);
+        CGConfigureDisplayOrigin(cfg, ids[i], (int32_t)b.origin.x - dx,
+                                 (int32_t)b.origin.y - dy);
+    }
+    CGError err = CGCompleteDisplayConfiguration(cfg, kCGConfigurePermanently);
+    NSLog(@"claimMain: shift arrangement by (%d,%d): %s (err=%d)", -dx, -dy,
+          err == kCGErrorSuccess ? "OK" : "FAILED", err);
+}
+
 static void mirrorNow(void) {
     static BOOL wasOffline = NO, wasAsleep = NO;
     if (displaysAsleep()) {
@@ -157,8 +184,15 @@ static void mirrorNow(void) {
               err == kCGErrorSuccess ? "OK" : "FAILED", err);
     }
     if (want) CFRelease(want);
+    if (err != kCGErrorSuccess) return; // retried on next poll
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
+        // Only promote an actually established mirror set; only after OUR
+        // transaction, so manual rearranging is respected otherwise.
+        CGDirectDisplayID d = findDell();
+        if (d == kCGNullDirectDisplay ||
+            CGDisplayMirrorsDisplay(d) != gVirtualID) return;
+        claimMain();
         CGDisplayModeRef cur = CGDisplayCopyDisplayMode(gVirtualID);
         if (!cur) return;
         CFAutorelease(cur);

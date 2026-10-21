@@ -40,6 +40,10 @@ clang -fobjc-arc -framework Foundation -framework CoreGraphics \
   display reverts to normal.
 - Survives KVM/cable disconnects: it re-establishes the mirror whenever
   the display reappears.
+- Opinionated: whenever the tool itself has to (re)establish the mirror,
+  the mirror set is made the **main display** (arrangement is translated,
+  relative display positions are preserved). Manual rearranging is
+  respected otherwise.
 
 ### Run at login
 
