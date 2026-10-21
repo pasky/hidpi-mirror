@@ -122,22 +122,33 @@ static void claimMain(void) {
     uint32_t n = 0;
     if (CGGetOnlineDisplayList(16, ids, &n) != kCGErrorSuccess) return;
     CGDisplayConfigRef cfg;
-    CGBeginDisplayConfiguration(&cfg);
+    if (CGBeginDisplayConfiguration(&cfg) != kCGErrorSuccess) return;
     for (uint32_t i = 0; i < n; i++) {
         if (CGDisplayMirrorsDisplay(ids[i]) != kCGNullDirectDisplay)
             continue; // mirror followers inherit their master's origin
         CGRect b = CGDisplayBounds(ids[i]);
-        CGConfigureDisplayOrigin(cfg, ids[i], (int32_t)b.origin.x - dx,
-                                 (int32_t)b.origin.y - dy);
+        if (CGConfigureDisplayOrigin(cfg, ids[i], (int32_t)b.origin.x - dx,
+                                     (int32_t)b.origin.y - dy) !=
+            kCGErrorSuccess) {
+            // Never persist a partial translation (e.g. hot-unplug).
+            CGCancelDisplayConfiguration(cfg);
+            NSLog(@"claimMain: configuring origin of %u failed", ids[i]);
+            return;
+        }
     }
     CGError err = CGCompleteDisplayConfiguration(cfg, kCGConfigurePermanently);
     NSLog(@"claimMain: shift arrangement by (%d,%d): %s (err=%d)", -dx, -dy,
           err == kCGErrorSuccess ? "OK" : "FAILED", err);
 }
 
+// Bumped on every mirror attempt and whenever the Dell is offline or the
+// displays sleep, invalidating pending claimMain follow-ups.
+static unsigned gMirrorSeq = 0;
+
 static void mirrorNow(void) {
     static BOOL wasOffline = NO, wasAsleep = NO;
     if (displaysAsleep()) {
+        gMirrorSeq++;
         if (!wasAsleep) NSLog(@"displays asleep, leaving configuration alone");
         wasAsleep = YES;
         return;
@@ -149,6 +160,7 @@ static void mirrorNow(void) {
         if (!wasOffline)
             NSLog(@"display not online (KVM switched away?), waiting...");
         wasOffline = YES;
+        gMirrorSeq++;
         return;
     }
     wasOffline = NO;
@@ -184,15 +196,17 @@ static void mirrorNow(void) {
               err == kCGErrorSuccess ? "OK" : "FAILED", err);
     }
     if (want) CFRelease(want);
-    if (err != kCGErrorSuccess) return; // retried on next poll
+    unsigned seq = ++gMirrorSeq;
+    // Claim main only if WE just (re)established the mirror -- not after a
+    // mode-only repair -- so manual rearranging is respected otherwise.
+    BOOL claim = !mirrored && err == kCGErrorSuccess;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
-        // Only promote an actually established mirror set; only after OUR
-        // transaction, so manual rearranging is respected otherwise.
-        CGDirectDisplayID d = findDell();
-        if (d == kCGNullDirectDisplay ||
-            CGDisplayMirrorsDisplay(d) != gVirtualID) return;
-        claimMain();
+        // Skip if superseded (new attempt, disconnect, display sleep --
+        // reconfiguring then blocks and fails) or the mirror didn't take.
+        if (claim && seq == gMirrorSeq && !displaysAsleep() &&
+            findDell() == dell && CGDisplayMirrorsDisplay(dell) == gVirtualID)
+            claimMain();
         CGDisplayModeRef cur = CGDisplayCopyDisplayMode(gVirtualID);
         if (!cur) return;
         CFAutorelease(cur);
