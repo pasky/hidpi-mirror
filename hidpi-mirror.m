@@ -250,17 +250,48 @@ static void reconfigCB(CGDirectDisplayID d, CGDisplayChangeSummaryFlags flags,
 #ifndef WATCHDOG_MATCH // overridable for testing
 #define WATCHDOG_MATCH "VirtualDisplay::clone_update failed"
 #endif
+// All watchdog state lives on its own serial queue: the main queue runs
+// CoreGraphics transactions that can block for 10s+.
+static dispatch_queue_t gWDQueue;
 static NSTask *gLogTask = nil;
 static CFAbsoluteTime gStartTime;
 
-static void watchdogHit(void) {
-    static CFAbsoluteTime windowStart = 0;
+// Restarts can't help if the failing virtual display isn't ours (another
+// app's): allow at most 3 watchdog restarts per 30 minutes, tracked
+// across restarts in a file.
+static BOOL restartAllowed(CFAbsoluteTime now) {
+    NSString *path = [NSTemporaryDirectory()
+        stringByAppendingPathComponent:@"hidpi-mirror.watchdog"];
+    NSArray *f = [[NSString stringWithContentsOfFile:path
+                                            encoding:NSUTF8StringEncoding
+                                               error:NULL]
+                     componentsSeparatedByString:@" "];
+    int count = f.count == 2 ? [f[0] intValue] : 0;
+    double last = f.count == 2 ? [f[1] doubleValue] : 0;
+    if (now - last >= 1800) count = 0;
+    if (count >= 3) return NO;
+    [[NSString stringWithFormat:@"%d %f", count + 1, now]
+        writeToFile:path atomically:YES encoding:NSUTF8StringEncoding
+              error:NULL];
+    return YES;
+}
+
+static void watchdogHit(void) { // on gWDQueue
+    static CFAbsoluteTime windowStart = 0, gaveUpAt = 0;
     static int hits = 0;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (now - windowStart > 10) { windowStart = now; hits = 0; }
     // Never healthy, but require a burst (and a minimum uptime, so a
     // persistent problem can't turn into a tight restart loop).
     if (++hits < 10 || now - gStartTime < 60) return;
+    if (!restartAllowed(now)) {
+        if (now - gaveUpAt >= 1800) {
+            NSLog(@"watchdog: restarts aren't helping (another app's virtual "
+                  @"display?), not restarting for now");
+            gaveUpAt = now;
+        }
+        return;
+    }
     NSLog(@"watchdog: WindowServer keeps failing to update our virtual "
           @"display (" WATCHDOG_MATCH "), restarting");
     // No unmirror(): reconfiguring may block; exiting destroys the
@@ -268,7 +299,13 @@ static void watchdogHit(void) {
     exit(3);
 }
 
-static void startWatchdog(void) {
+static void startWatchdog(void);
+static void restartWatchdogLater(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+                   gWDQueue, ^{ startWatchdog(); });
+}
+
+static void startWatchdog(void) { // on gWDQueue
     NSTask *t = [[NSTask alloc] init];
     t.executableURL = [NSURL fileURLWithPath:@"/usr/bin/log"];
     t.arguments = @[ @"stream", @"--style", @"compact", @"--predicate",
@@ -277,38 +314,47 @@ static void startWatchdog(void) {
     NSPipe *pipe = [NSPipe pipe];
     t.standardOutput = pipe;
     t.standardError = [NSFileHandle fileHandleWithNullDevice];
+    NSMutableData *buf = [NSMutableData data]; // pipe reads aren't lines
     pipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *h) {
         NSData *d = h.availableData;
-        if (!d.length) { h.readabilityHandler = nil; return; } // EOF
-        // Count matching lines (skips log stream's "Filtering..." header).
-        NSString *s = [[NSString alloc] initWithData:d
-                                            encoding:NSUTF8StringEncoding];
-        NSUInteger n = 0;
-        for (NSString *l in [s componentsSeparatedByString:@"\n"])
-            if ([l containsString:@"WindowServer"] &&
-                [l containsString:@WATCHDOG_MATCH]) n++;
-        if (n) dispatch_async(dispatch_get_main_queue(), ^{
-            for (NSUInteger i = 0; i < n; i++) watchdogHit();
+        dispatch_async(gWDQueue, ^{
+            if (!d.length) return; // EOF; terminationHandler respawns
+            [buf appendData:d];
+            const char *b = buf.bytes, *nl;
+            size_t off = 0, len = buf.length;
+            while ((nl = memchr(b + off, '\n', len - off))) {
+                // Count matching lines (skips log stream's header line).
+                NSString *l = [[NSString alloc]
+                    initWithBytes:b + off length:nl - (b + off)
+                         encoding:NSUTF8StringEncoding];
+                if ([l containsString:@"WindowServer"] &&
+                    [l containsString:@WATCHDOG_MATCH])
+                    watchdogHit();
+                off = nl - b + 1;
+            }
+            [buf replaceBytesInRange:NSMakeRange(0, off) withBytes:NULL
+                              length:0];
         });
+        if (!d.length) h.readabilityHandler = nil;
     };
     t.terminationHandler = ^(NSTask *task) {
         NSLog(@"watchdog: log stream exited (%d), restarting it in 10s",
               task.terminationStatus);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
-                       dispatch_get_main_queue(), ^{ startWatchdog(); });
+        restartWatchdogLater();
     };
     NSError *err = nil;
     if (![t launchAndReturnError:&err]) {
-        NSLog(@"watchdog: can't run log stream: %@", err);
+        NSLog(@"watchdog: can't run log stream (%@), retrying in 10s", err);
+        restartWatchdogLater();
         return;
     }
     gLogTask = t;
 }
 
-// Don't leave an orphaned log stream behind when we exit.
+// Don't leave an orphaned log stream behind when we exit (atexit; may run
+// on any thread, incl. gWDQueue -- so no dispatch_sync here).
 static void stopWatchdog(void) {
     NSTask *t = gLogTask;
-    gLogTask = nil;
     if (t.running) { t.terminationHandler = nil; [t terminate]; }
 }
 
@@ -403,8 +449,9 @@ int main(int argc, char *argv[]) {
         dispatch_resume(sigterm);
 
         gStartTime = CFAbsoluteTimeGetCurrent();
+        gWDQueue = dispatch_queue_create("watchdog", DISPATCH_QUEUE_SERIAL);
         atexit(stopWatchdog);
-        startWatchdog();
+        dispatch_async(gWDQueue, ^{ startWatchdog(); });
 
         CGDisplayRegisterReconfigurationCallback(reconfigCB, NULL);
         mirrorNow();
