@@ -239,6 +239,79 @@ static void reconfigCB(CGDirectDisplayID d, CGDisplayChangeSummaryFlags flags,
     }
 }
 
+// ---- Watchdog: WindowServer failing to feed our virtual display ----
+// Observed after days of sleep/wake/unplug cycles: our virtual display
+// instance goes bad and WindowServer logs "VirtualDisplay::clone_update
+// failed to copy surface" up to once per frame (120/s), freezing the
+// built-in display and never mirroring onto a reconnected Dell. Our own
+// CoreGraphics view sees nothing wrong (it goes stale too). A fresh
+// process with a fresh virtual display fixes it, so watch WindowServer's
+// log and exit -- launchd (KeepAlive) restarts us.
+#ifndef WATCHDOG_MATCH // overridable for testing
+#define WATCHDOG_MATCH "VirtualDisplay::clone_update failed"
+#endif
+static NSTask *gLogTask = nil;
+static CFAbsoluteTime gStartTime;
+
+static void watchdogHit(void) {
+    static CFAbsoluteTime windowStart = 0;
+    static int hits = 0;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - windowStart > 10) { windowStart = now; hits = 0; }
+    // Never healthy, but require a burst (and a minimum uptime, so a
+    // persistent problem can't turn into a tight restart loop).
+    if (++hits < 10 || now - gStartTime < 60) return;
+    NSLog(@"watchdog: WindowServer keeps failing to update our virtual "
+          @"display (" WATCHDOG_MATCH "), restarting");
+    // No unmirror(): reconfiguring may block; exiting destroys the
+    // virtual display and with it the mirror.
+    exit(3);
+}
+
+static void startWatchdog(void) {
+    NSTask *t = [[NSTask alloc] init];
+    t.executableURL = [NSURL fileURLWithPath:@"/usr/bin/log"];
+    t.arguments = @[ @"stream", @"--style", @"compact", @"--predicate",
+        @"process == \"WindowServer\" AND eventMessage CONTAINS \""
+        WATCHDOG_MATCH "\"" ];
+    NSPipe *pipe = [NSPipe pipe];
+    t.standardOutput = pipe;
+    t.standardError = [NSFileHandle fileHandleWithNullDevice];
+    pipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *h) {
+        NSData *d = h.availableData;
+        if (!d.length) { h.readabilityHandler = nil; return; } // EOF
+        // Count matching lines (skips log stream's "Filtering..." header).
+        NSString *s = [[NSString alloc] initWithData:d
+                                            encoding:NSUTF8StringEncoding];
+        NSUInteger n = 0;
+        for (NSString *l in [s componentsSeparatedByString:@"\n"])
+            if ([l containsString:@"WindowServer"] &&
+                [l containsString:@WATCHDOG_MATCH]) n++;
+        if (n) dispatch_async(dispatch_get_main_queue(), ^{
+            for (NSUInteger i = 0; i < n; i++) watchdogHit();
+        });
+    };
+    t.terminationHandler = ^(NSTask *task) {
+        NSLog(@"watchdog: log stream exited (%d), restarting it in 10s",
+              task.terminationStatus);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{ startWatchdog(); });
+    };
+    NSError *err = nil;
+    if (![t launchAndReturnError:&err]) {
+        NSLog(@"watchdog: can't run log stream: %@", err);
+        return;
+    }
+    gLogTask = t;
+}
+
+// Don't leave an orphaned log stream behind when we exit.
+static void stopWatchdog(void) {
+    NSTask *t = gLogTask;
+    gLogTask = nil;
+    if (t.running) { t.terminationHandler = nil; [t terminate]; }
+}
+
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         CGVirtualDisplayDescriptor *desc =
@@ -328,6 +401,10 @@ int main(int argc, char *argv[]) {
         dispatch_source_set_event_handler(sigterm, bail);
         dispatch_resume(sigint);
         dispatch_resume(sigterm);
+
+        gStartTime = CFAbsoluteTimeGetCurrent();
+        atexit(stopWatchdog);
+        startWatchdog();
 
         CGDisplayRegisterReconfigurationCallback(reconfigCB, NULL);
         mirrorNow();
