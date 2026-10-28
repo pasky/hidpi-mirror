@@ -144,6 +144,11 @@ static void claimMain(void) {
 // Bumped on every mirror attempt and whenever the Dell is offline or the
 // displays sleep, invalidating pending claimMain follow-ups.
 static unsigned gMirrorSeq = 0;
+// Claim main once per (re)appearance of the Dell (and at startup) --
+// even when WindowServer restored the mirror by itself, which restores
+// the mirror but not reliably the main role. Manual rearranging is
+// respected until the next reconnect.
+static BOOL gClaimPending = YES;
 
 static void mirrorNow(void) {
     static BOOL wasOffline = NO, wasAsleep = NO;
@@ -161,6 +166,7 @@ static void mirrorNow(void) {
             NSLog(@"display not online (KVM switched away?), waiting...");
         wasOffline = YES;
         gMirrorSeq++;
+        gClaimPending = YES;
         return;
     }
     wasOffline = NO;
@@ -173,7 +179,10 @@ static void mirrorNow(void) {
     BOOL rightMode =
         curMode && CGDisplayModeGetPixelWidth(curMode) == 2 * gLW;
     if (curMode) CFRelease(curMode);
-    if (mirrored && rightMode) return; // nothing to do
+    if (mirrored && rightMode) {
+        if (gClaimPending) { gClaimPending = NO; claimMain(); }
+        return;
+    }
     CGDisplayModeRef want = rightMode ? NULL : copyWantedMode();
     NSLog(@"mirrorNow: mirrored=%d rightMode=%d want=%s", mirrored, rightMode,
           want ? "found" : "NULL");
@@ -197,16 +206,18 @@ static void mirrorNow(void) {
     }
     if (want) CFRelease(want);
     unsigned seq = ++gMirrorSeq;
-    // Claim main only if WE just (re)established the mirror -- not after a
-    // mode-only repair -- so manual rearranging is respected otherwise.
-    BOOL claim = !mirrored && err == kCGErrorSuccess;
+    // Claim main if WE just (re)established the mirror, or the Dell just
+    // reappeared -- not after a mode-only repair otherwise.
+    BOOL claim = (!mirrored || gClaimPending) && err == kCGErrorSuccess;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         // Skip if superseded (new attempt, disconnect, display sleep --
         // reconfiguring then blocks and fails) or the mirror didn't take.
         if (claim && seq == gMirrorSeq && !displaysAsleep() &&
-            findDell() == dell && CGDisplayMirrorsDisplay(dell) == gVirtualID)
+            findDell() == dell && CGDisplayMirrorsDisplay(dell) == gVirtualID) {
+            gClaimPending = NO;
             claimMain();
+        }
         CGDisplayModeRef cur = CGDisplayCopyDisplayMode(gVirtualID);
         if (!cur) return;
         CFAutorelease(cur);
@@ -281,9 +292,10 @@ static void watchdogHit(void) { // on gWDQueue
     static int hits = 0;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (now - windowStart > 10) { windowStart = now; hits = 0; }
-    // Never healthy, but require a burst (and a minimum uptime, so a
-    // persistent problem can't turn into a tight restart loop).
-    if (++hits < 10 || now - gStartTime < 60) return;
+    // Never healthy, but require a few (seen: just 5 at a replug, then
+    // silence with the Dell black) and a minimum uptime, so a persistent
+    // problem can't turn into a tight restart loop.
+    if (++hits < 3 || now - gStartTime < 60) return;
     if (!restartAllowed(now)) {
         if (now - gaveUpAt >= 1800) {
             NSLog(@"watchdog: restarts aren't helping (another app's virtual "

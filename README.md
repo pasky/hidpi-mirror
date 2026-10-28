@@ -40,10 +40,14 @@ clang -fobjc-arc -framework Foundation -framework CoreGraphics \
   display reverts to normal.
 - Survives KVM/cable disconnects: it re-establishes the mirror whenever
   the display reappears.
-- Opinionated: whenever the tool itself has to (re)establish the mirror,
-  the mirror set is made the **main display** (arrangement is translated,
-  relative display positions are preserved). Manual rearranging is
-  respected otherwise.
+- Opinionated: at startup and whenever the display reconnects, the mirror
+  set is made the **main display** (arrangement is translated, relative
+  display positions are preserved). Manual rearranging is respected until
+  the next reconnect.
+- Watchdog: if WindowServer starts failing to update the virtual display
+  (`VirtualDisplay::clone_update failed` in its log; seen after days of
+  sleep/unplug cycles as a frozen built-in / black external display), the
+  tool exits so launchd restarts it with a fresh virtual display.
 
 ### Run at login
 
