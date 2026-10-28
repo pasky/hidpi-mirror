@@ -94,7 +94,8 @@ static CGDisplayModeRef copyWantedMode(void) {
     return want;
 }
 
-// YES unless some physical (non-virtual) online display is awake. While
+// YES unless the built-in or the Dell is online and awake (other virtual
+// displays, e.g. other apps', may claim to be awake regardless). While
 // the displays sleep (incl. dark wakes), WindowServer reports the Dell as
 // unmirrored, but can't reconfigure anything: transactions block 10s+
 // and fail (err 1014), often spanning system sleep. It restores the
@@ -104,28 +105,31 @@ static BOOL displaysAsleep(void) {
     uint32_t n = 0;
     if (CGGetOnlineDisplayList(16, ids, &n) != kCGErrorSuccess) return YES;
     for (uint32_t i = 0; i < n; i++)
-        if (ids[i] != gVirtualID && !CGDisplayIsAsleep(ids[i])) return NO;
+        if ((CGDisplayIsBuiltin(ids[i]) ||
+             CGDisplayVendorNumber(ids[i]) == gVendor) &&
+            !CGDisplayIsAsleep(ids[i]))
+            return NO;
     return YES;
 }
 
-// When WindowServer fails to restore the saved arrangement and we have to
-// re-establish the mirror ourselves (e.g. after a messy reconnect with
-// err 1014 transactions), the built-in display ends up main -- reclaim
-// the main role for the mirror set. Translate the WHOLE arrangement so
-// the virtual display lands on (0,0): setting just one display's origin
-// is silently normalized away. Separate transaction after the mirror.
-static void claimMain(void) {
+// After a reconnect (or our restart), the mirror comes back -- restored by
+// WindowServer or by us -- but often with the built-in display as main;
+// reclaim the main role for the mirror set. Translate the WHOLE
+// arrangement so the virtual display lands on (0,0): setting just one
+// display's origin is silently normalized away. Separate transaction
+// after the mirror. Returns YES once the mirror set is main.
+static BOOL claimMain(void) {
     CGRect vb = CGDisplayBounds(gVirtualID);
     int32_t dx = (int32_t)vb.origin.x, dy = (int32_t)vb.origin.y;
     if (dx == 0 && dy == 0) {
         NSLog(@"claimMain: mirror set already main");
-        return;
+        return YES;
     }
     CGDirectDisplayID ids[16];
     uint32_t n = 0;
-    if (CGGetOnlineDisplayList(16, ids, &n) != kCGErrorSuccess) return;
+    if (CGGetOnlineDisplayList(16, ids, &n) != kCGErrorSuccess) return NO;
     CGDisplayConfigRef cfg;
-    if (CGBeginDisplayConfiguration(&cfg) != kCGErrorSuccess) return;
+    if (CGBeginDisplayConfiguration(&cfg) != kCGErrorSuccess) return NO;
     for (uint32_t i = 0; i < n; i++) {
         if (CGDisplayMirrorsDisplay(ids[i]) != kCGNullDirectDisplay)
             continue; // mirror followers inherit their master's origin
@@ -136,12 +140,13 @@ static void claimMain(void) {
             // Never persist a partial translation (e.g. hot-unplug).
             CGCancelDisplayConfiguration(cfg);
             NSLog(@"claimMain: configuring origin of %u failed", ids[i]);
-            return;
+            return NO;
         }
     }
     CGError err = CGCompleteDisplayConfiguration(cfg, kCGConfigurePermanently);
     NSLog(@"claimMain: shift arrangement by (%d,%d): %s (err=%d)", -dx, -dy,
           err == kCGErrorSuccess ? "OK" : "FAILED", err);
+    return err == kCGErrorSuccess;
 }
 
 // Bumped on every mirror attempt and whenever the Dell is offline or the
@@ -152,6 +157,24 @@ static unsigned gMirrorSeq = 0;
 // the mirror but not reliably the main role. Manual rearranging is
 // respected until the next reconnect.
 static BOOL gClaimPending = YES;
+static int gClaimFailures = 0;
+static CGDirectDisplayID gLastDell = kCGNullDirectDisplay;
+
+static void armClaim(void) {
+    gClaimPending = YES;
+    gClaimFailures = 0;
+}
+
+// Keep the claim pending until it succeeds (retried by the next polls),
+// but give up after a few failures -- each can block for seconds.
+static void tryClaim(void) {
+    if (claimMain()) {
+        gClaimPending = NO;
+    } else if (++gClaimFailures >= 5) {
+        NSLog(@"claimMain: giving up until the next reconnect");
+        gClaimPending = NO;
+    }
+}
 
 static void mirrorNow(void) {
     static BOOL wasOffline = NO, wasAsleep = NO;
@@ -169,10 +192,11 @@ static void mirrorNow(void) {
             NSLog(@"display not online (KVM switched away?), waiting...");
         wasOffline = YES;
         gMirrorSeq++;
-        gClaimPending = YES;
+        armClaim();
         return;
     }
     wasOffline = NO;
+    gLastDell = dell;
     BOOL mirrored = (CGDisplayMirrorsDisplay(dell) == gVirtualID);
     // NB: CGDisplayCopyDisplayMode can return NULL (CFAutorelease(NULL)
     // would crash), e.g. while the virtual display is the master of a
@@ -183,7 +207,7 @@ static void mirrorNow(void) {
         curMode && CGDisplayModeGetPixelWidth(curMode) == 2 * gLW;
     if (curMode) CFRelease(curMode);
     if (mirrored && rightMode) {
-        if (gClaimPending) { gClaimPending = NO; claimMain(); }
+        if (gClaimPending) tryClaim();
         return;
     }
     CGDisplayModeRef want = rightMode ? NULL : copyWantedMode();
@@ -218,8 +242,7 @@ static void mirrorNow(void) {
         // reconfiguring then blocks and fails) or the mirror didn't take.
         if (claim && seq == gMirrorSeq && !displaysAsleep() &&
             findDell() == dell && CGDisplayMirrorsDisplay(dell) == gVirtualID) {
-            gClaimPending = NO;
-            claimMain();
+            tryClaim();
         }
         CGDisplayModeRef cur = CGDisplayCopyDisplayMode(gVirtualID);
         if (!cur) return;
@@ -245,6 +268,16 @@ static void unmirror(void) {
 
 static void reconfigCB(CGDirectDisplayID d, CGDisplayChangeSummaryFlags flags,
                        void *userInfo) {
+    if (flags & kCGDisplayBeginConfigurationFlag) return;
+    // The Dell (dis)appeared: (re)claim main once it's back, even if a
+    // poll never saw it offline (quick replug, or unplugged while asleep);
+    // a removal also invalidates pending claimMain follow-ups.
+    if (((flags & kCGDisplayRemoveFlag) && d == gLastDell) ||
+        ((flags & kCGDisplayAddFlag) && d != gVirtualID &&
+         CGDisplayVendorNumber(d) == gVendor)) {
+        gMirrorSeq++;
+        armClaim();
+    }
     if (flags & kCGDisplayAddFlag) {
         // Display (re)appeared -- e.g. KVM switched back. Give WindowServer
         // a moment to settle, then re-establish the mirror.
@@ -258,12 +291,16 @@ static void reconfigCB(CGDirectDisplayID d, CGDisplayChangeSummaryFlags flags,
 // one) can go bad: WindowServer logs "VirtualDisplay::clone_update failed
 // to copy surface" -- a burst at the unplug, up to once per frame (120/s)
 // later -- freezing the built-in display, and a reconnected Dell stays
-// black. Our own
-// CoreGraphics view sees nothing wrong (it goes stale too). A fresh
-// process with a fresh virtual display fixes it, so watch WindowServer's
-// log and exit -- launchd (KeepAlive) restarts us.
+// black. Our own CoreGraphics view sees nothing wrong (it goes stale
+// too). A fresh process with a fresh virtual display fixes it, so watch
+// WindowServer's log and exit -- launchd (KeepAlive) restarts us. The log
+// line doesn't say WHICH virtual display failed, so it might be another
+// app's; the restart budget below bounds the damage.
 #ifndef WATCHDOG_MATCH // overridable for testing
 #define WATCHDOG_MATCH "VirtualDisplay::clone_update failed"
+#endif
+#ifndef WATCHDOG_STATE // overridable for testing
+#define WATCHDOG_STATE @"hidpi-mirror.watchdog"
 #endif
 // All watchdog state lives on its own serial queue: the main queue runs
 // CoreGraphics transactions that can block for 10s+.
@@ -272,48 +309,67 @@ static NSTask *gLogTask = nil;
 static CFAbsoluteTime gStartTime;
 
 // Restarts can't help if the failing virtual display isn't ours (another
-// app's): allow at most 10 watchdog restarts per 30 minutes, tracked
+// app's): allow at most 10 watchdog restarts in any 30 minutes, tracked
 // across restarts in a file. (Not fewer: every unplug of the Dell breaks
 // our virtual display and costs one restart -- think KVM switching.)
-static BOOL restartAllowed(CFAbsoluteTime now) {
+// Returns 0 (and records the restart) if allowed now, else the number of
+// seconds until it will be.
+static double restartWait(CFAbsoluteTime now) {
     NSString *path = [NSTemporaryDirectory()
-        stringByAppendingPathComponent:@"hidpi-mirror.watchdog"];
-    NSArray *f = [[NSString stringWithContentsOfFile:path
-                                            encoding:NSUTF8StringEncoding
-                                               error:NULL]
-                     componentsSeparatedByString:@" "];
-    int count = f.count == 2 ? [f[0] intValue] : 0;
-    double last = f.count == 2 ? [f[1] doubleValue] : 0;
-    if (now - last >= 1800) count = 0;
-    if (count >= 10) return NO;
-    [[NSString stringWithFormat:@"%d %f", count + 1, now]
+        stringByAppendingPathComponent:WATCHDOG_STATE];
+    NSString *old = [NSString stringWithContentsOfFile:path
+                                              encoding:NSUTF8StringEncoding
+                                                 error:NULL];
+    NSMutableArray *recent = [NSMutableArray array];
+    double oldest = now;
+    for (NSString *f in [old componentsSeparatedByString:@" "]) {
+        double t = f.doubleValue;
+        if (now - t < 1800 && t <= now) {
+            [recent addObject:f];
+            if (t < oldest) oldest = t;
+        }
+    }
+    if (recent.count >= 10) return oldest + 1800 - now;
+    [recent addObject:[NSString stringWithFormat:@"%f", now]];
+    [[recent componentsJoinedByString:@" "]
         writeToFile:path atomically:YES encoding:NSUTF8StringEncoding
               error:NULL];
-    return YES;
+    return 0;
 }
 
-static void watchdogHit(void) { // on gWDQueue
-    static CFAbsoluteTime windowStart = 0, gaveUpAt = 0;
-    static int hits = 0;
+// A burst was seen: the display stays broken even after the log goes
+// silent, so a restart that isn't allowed yet is deferred, not dropped.
+static void watchdogRestart(void) { // on gWDQueue
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (now - windowStart > 10) { windowStart = now; hits = 0; }
-    // Never healthy, but require a few (seen: just 5 at a replug, then
-    // silence with the Dell black) and a minimum uptime, so a persistent
-    // problem can't turn into a tight restart loop.
-    if (++hits < 3 || now - gStartTime < 60) return;
-    if (!restartAllowed(now)) {
-        if (now - gaveUpAt >= 1800) {
-            NSLog(@"watchdog: restarts aren't helping (another app's virtual "
-                  @"display?), not restarting for now");
-            gaveUpAt = now;
-        }
+    // Minimum uptime, so a persistent problem can't become a tight loop.
+    double wait = gStartTime + 60 - now;
+    if (wait <= 0) wait = restartWait(now);
+    if (wait > 0) {
+        NSLog(@"watchdog: a virtual display is failing, restart deferred "
+              @"by %.0fs (uptime / restart budget)", wait);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(wait * NSEC_PER_SEC) + 1),
+                       gWDQueue, ^{ watchdogRestart(); });
         return;
     }
-    NSLog(@"watchdog: WindowServer keeps failing to update our virtual "
+    NSLog(@"watchdog: WindowServer keeps failing to update a virtual "
           @"display (" WATCHDOG_MATCH "), restarting");
     // No unmirror(): reconfiguring may block; exiting destroys the
     // virtual display and with it the mirror.
     exit(3);
+}
+
+static void watchdogHit(void) { // on gWDQueue
+    static CFAbsoluteTime windowStart = 0;
+    static int hits = 0;
+    static BOOL latched = NO;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - windowStart > 10) { windowStart = now; hits = 0; }
+    // Never healthy, but require a few (seen: just 5 at an unplug, then
+    // silence with the Dell black on replug).
+    if (++hits < 3 || latched) return;
+    latched = YES;
+    watchdogRestart();
 }
 
 static void startWatchdog(void);
@@ -415,11 +471,8 @@ int main(int argc, char *argv[]) {
         CGVirtualDisplaySettings *settings =
             [[NSClassFromString(@"CGVirtualDisplaySettings") alloc] init];
         settings.hiDPI = 1;
-        // Offer exactly ONE mode: the desired "looks like" size at 2x.
-        // This way neither macOS nor a stray click can pick a wrong mode.
-        // Full mode list (macOS only synthesizes proper HiDPI variants with
-        // a rich list topped by maxPixels); the desired one is selected
-        // explicitly in setHiDPIMode().
+        // Full mode list: macOS only synthesizes proper HiDPI variants for
+        // a rich list topped by maxPixels.
         Class modeCls = NSClassFromString(@"CGVirtualDisplayMode");
         // WindowServer ignores programmatic mode changes on virtual displays
         // and always runs the PREFERRED (first listed) mode -- so put the

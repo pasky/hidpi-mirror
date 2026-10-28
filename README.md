@@ -39,7 +39,9 @@ clang -fobjc-arc -framework Foundation -framework CoreGraphics \
 - The tool must keep running; on exit (Ctrl-C/SIGTERM) the physical
   display reverts to normal.
 - Survives KVM/cable disconnects: it re-establishes the mirror whenever
-  the display reappears.
+  the display reappears. While the display is disconnected, the
+  virtual display stays around as invisible screen estate (windows can
+  end up there) -- creating it on demand instead proved unreliable.
 - Opinionated: at startup and whenever the display reconnects, the mirror
   set is made the **main display** (arrangement is translated, relative
   display positions are preserved). Manual rearranging is respected until
@@ -47,8 +49,10 @@ clang -fobjc-arc -framework Foundation -framework CoreGraphics \
 - Watchdog: if WindowServer starts failing to update the virtual display
   (`VirtualDisplay::clone_update failed` in its log; happens when the
   display is unplugged, otherwise showing up as a frozen built-in display
-  and a black external display on replug), the tool exits so launchd
-  restarts it with a fresh virtual display.
+  and a black external display on replug), the tool exits so it can be
+  restarted with a fresh virtual display -- this needs a supervisor such
+  as the launchd agent below (`KeepAlive`). At most 10 restarts per 30
+  minutes.
 
 ### Run at login
 
