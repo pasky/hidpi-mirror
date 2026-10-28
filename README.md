@@ -45,9 +45,10 @@ clang -fobjc-arc -framework Foundation -framework CoreGraphics \
   display positions are preserved). Manual rearranging is respected until
   the next reconnect.
 - Watchdog: if WindowServer starts failing to update the virtual display
-  (`VirtualDisplay::clone_update failed` in its log; seen after days of
-  sleep/unplug cycles as a frozen built-in / black external display), the
-  tool exits so launchd restarts it with a fresh virtual display.
+  (`VirtualDisplay::clone_update failed` in its log; happens when the
+  display is unplugged, otherwise showing up as a frozen built-in display
+  and a black external display on replug), the tool exits so launchd
+  restarts it with a fresh virtual display.
 
 ### Run at login
 

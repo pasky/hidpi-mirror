@@ -117,7 +117,10 @@ static BOOL displaysAsleep(void) {
 static void claimMain(void) {
     CGRect vb = CGDisplayBounds(gVirtualID);
     int32_t dx = (int32_t)vb.origin.x, dy = (int32_t)vb.origin.y;
-    if (dx == 0 && dy == 0) return; // already main
+    if (dx == 0 && dy == 0) {
+        NSLog(@"claimMain: mirror set already main");
+        return;
+    }
     CGDirectDisplayID ids[16];
     uint32_t n = 0;
     if (CGGetOnlineDisplayList(16, ids, &n) != kCGErrorSuccess) return;
@@ -251,10 +254,11 @@ static void reconfigCB(CGDirectDisplayID d, CGDisplayChangeSummaryFlags flags,
 }
 
 // ---- Watchdog: WindowServer failing to feed our virtual display ----
-// Observed after days of sleep/wake/unplug cycles: our virtual display
-// instance goes bad and WindowServer logs "VirtualDisplay::clone_update
-// failed to copy surface" up to once per frame (120/s), freezing the
-// built-in display and never mirroring onto a reconnected Dell. Our own
+// When the Dell is unplugged, our virtual display instance (even a fresh
+// one) can go bad: WindowServer logs "VirtualDisplay::clone_update failed
+// to copy surface" -- a burst at the unplug, up to once per frame (120/s)
+// later -- freezing the built-in display, and a reconnected Dell stays
+// black. Our own
 // CoreGraphics view sees nothing wrong (it goes stale too). A fresh
 // process with a fresh virtual display fixes it, so watch WindowServer's
 // log and exit -- launchd (KeepAlive) restarts us.
@@ -268,8 +272,9 @@ static NSTask *gLogTask = nil;
 static CFAbsoluteTime gStartTime;
 
 // Restarts can't help if the failing virtual display isn't ours (another
-// app's): allow at most 3 watchdog restarts per 30 minutes, tracked
-// across restarts in a file.
+// app's): allow at most 10 watchdog restarts per 30 minutes, tracked
+// across restarts in a file. (Not fewer: every unplug of the Dell breaks
+// our virtual display and costs one restart -- think KVM switching.)
 static BOOL restartAllowed(CFAbsoluteTime now) {
     NSString *path = [NSTemporaryDirectory()
         stringByAppendingPathComponent:@"hidpi-mirror.watchdog"];
@@ -280,7 +285,7 @@ static BOOL restartAllowed(CFAbsoluteTime now) {
     int count = f.count == 2 ? [f[0] intValue] : 0;
     double last = f.count == 2 ? [f[1] doubleValue] : 0;
     if (now - last >= 1800) count = 0;
-    if (count >= 3) return NO;
+    if (count >= 10) return NO;
     [[NSString stringWithFormat:@"%d %f", count + 1, now]
         writeToFile:path atomically:YES encoding:NSUTF8StringEncoding
               error:NULL];
